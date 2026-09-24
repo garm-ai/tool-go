@@ -1,0 +1,24 @@
+# Toolchain and tasks for tool-go. Task names match every other garm-ai
+# repository: `mise run test` means the same thing everywhere.
+[tools]
+go = "1.26"
+
+[tasks.build]
+description = "Build every package"
+run = "go build ./..."
+
+[tasks.test]
+description = "Run the tests"
+run = "go test ./... -race -count=1"
+
+[tasks.lint]
+description = "Vet the Go"
+run = "go vet ./..."
+
+[tasks.fmt]
+description = "Format"
+run = "go fmt ./..."
+
+[tasks.ci]
+description = "Everything CI runs"
+depends = ["lint", "build", "test"]

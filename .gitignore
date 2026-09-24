@@ -1,0 +1,10 @@
+bin/
+*.out
+*.test
+coverage.*
+.DS_Store
+*.swp
+.idea/
+.vscode/
+mise.local.toml
+.mise.local.toml

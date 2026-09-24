@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v2
+        with: { install: true, cache: true }
+      - run: mise run lint
+      - run: mise run build
+      - run: mise run test
+
+  boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v2
+        with: { install: true, cache: true }
+
+      # The boundary this repository exists to hold. A tool service must not
+      # be able to reach the enforcing code and run the chain itself — a
+      # second, unreviewed implementation of governance in the one place that
+      # must not have one.
+      - name: no dependency on the daemon
+        run: |
+          if go list -deps ./... 2>/dev/null | grep -E 'garm-ai/garmd'; then
+            echo "::error::tool-go depends on the daemon; a tool must not be able to enforce" >&2
+            exit 1
+          fi
+          echo "clean: tool-go depends on no daemon"
+
+      # toolbind is what every generated binding links, so anything it pulls
+      # in is pulled into every tool service anyone writes. Keeping it to
+      # protobuf is what makes choosing a different runtime possible later.
+      - name: toolbind stays thin
+        run: |
+          if go list -deps ./toolbind 2>/dev/null | grep -E 'nats|garm-ai'; then
+            echo "::error::toolbind reached beyond protobuf; it is linked by every tool service" >&2
+            exit 1
+          fi
+          echo "clean: toolbind depends on protobuf and nothing else"

@@ -34,4 +34,8 @@ The same boundary means your build does not inherit garm's dependency tree.
 
 ## Status
 
-Not yet seeded. Intent recorded; code arrives at Phase 5 of the split.
+Early. `toolbind` and a NATS runtime that serves registered tools and drains
+on shutdown. Health, structured errors, middleware, cancellation, idempotency
+and the conformance suite are not built.
+
+MIT licensed.
