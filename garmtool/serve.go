@@ -41,7 +41,16 @@ type Service struct {
 // the drift that reconciliation exists to catch, so it should come from the
 // build rather than from a literal.
 func New(name, version string) *Service {
-	return &Service{name: name, version: version, methods: map[string]toolbind.Method{}}
+	// NATS micro requires bare semver and rejects a leading "v", while a Go
+	// module version always carries one — so passing the obvious thing, the
+	// version of the module being served, would fail at startup with a
+	// message about SemVer that does not mention the v. Stripping it is
+	// kinder than explaining it.
+	return &Service{
+		name:    name,
+		version: strings.TrimPrefix(version, "v"),
+		methods: map[string]toolbind.Method{},
+	}
 }
 
 // Register implements toolbind.Registrar.
@@ -109,11 +118,20 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 
 	for route, m := range methods {
 		m := m
-		group := svc.AddGroup(QueueGroup(route))
-		endpoint := lastSegment(route)
-		if err := group.AddEndpoint(endpoint,
+		// Endpoints go on the service directly, with the full subject.
+		//
+		// Not via AddGroup: a group PREFIXES the subject it is given, so a
+		// group named for the service plus a subject already containing the
+		// service yields calc.v1.Calculator.calc.v1.Calculator.Add — a
+		// service that starts cleanly and answers nothing.
+		//
+		// The queue group is set explicitly to the proto service name, which
+		// is what makes NATS balance across replicas of one service and only
+		// that service.
+		if err := svc.AddEndpoint(endpointName(route),
 			micro.HandlerFunc(func(r micro.Request) { s.handle(ctx, m, r) }),
 			micro.WithEndpointSubject(Subject(route)),
+			micro.WithEndpointQueueGroup(QueueGroup(route)),
 		); err != nil {
 			return fmt.Errorf("serving %s: %w", route, err)
 		}
@@ -155,9 +173,12 @@ func (s *Service) handle(ctx context.Context, m toolbind.Method, r micro.Request
 	_ = r.Respond(body)
 }
 
-func lastSegment(route string) string {
-	if i := strings.LastIndex(route, "/"); i >= 0 {
-		return route[i+1:]
-	}
-	return route
+// endpointName is what $SRV.INFO shows for a route.
+//
+// Underscored rather than dotted because micro rejects a dot in a name, and
+// the full route rather than just the method because two proto services in
+// one process would otherwise both offer an endpoint called "Get" — and the
+// second registration is what fails, long after the first looked fine.
+func endpointName(route string) string {
+	return strings.ReplaceAll(Subject(route), ".", "_")
 }
