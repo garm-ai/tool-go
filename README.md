@@ -10,7 +10,7 @@ serving a governed tool is a handler body and a `main`, and nothing else.
 | `garmtool/` | Serve, lifecycle, health, drain, structured errors, middleware, cancellation, idempotency. |
 | `testkit/` | The harness for testing your own tool service. |
 | `templates/` | What `garm new toolservice --lang go` writes. |
-| `conformance/` | Runs the suite published by [`spec`](../spec) against your service. |
+| `conformance/` | Runs the suite published by [`garm`](../garm) against your service. |
 
 ## Why this is its own repository
 
@@ -28,8 +28,8 @@ The same boundary means your build does not inherit garm's dependency tree.
 
 - **Enforcement.** Your service receives a request that has already passed the
   chain. It does not re-check, and it is not given the means to.
-- **The annotations or the generator** — [`spec`](../spec).
-- **The garm-side test harness.** [`garm`](../garm) has its own, for testing
+- **The annotations or the generator** — [`garm`](../garm).
+- **The garm-side test harness.** [`garmd`](../garmd) has its own, for testing
   the chain. This one is for testing your handler.
 
 ## Status
