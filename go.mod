@@ -3,6 +3,7 @@ module github.com/garm-ai/tool-go
 go 1.26.0
 
 require (
+	github.com/garm-ai/garm v0.4.0
 	github.com/nats-io/nats.go v1.54.0
 	google.golang.org/protobuf v1.36.12
 )

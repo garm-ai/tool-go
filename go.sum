@@ -1,3 +1,5 @@
+github.com/garm-ai/garm v0.4.0 h1:m+OWET1Z395VUhX19QVlHHdtmxlBXXiIfkbgyLGc9WA=
+github.com/garm-ai/garm v0.4.0/go.mod h1:Vlb8Yuym87Zy4FBREZwmihlD9itTbr+2m/2kqYp8WoA=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/klauspost/compress v1.20.0 h1:a3C1ke2ohxFymNlb2HWAHjDeKCI90scRskErZkR0ezA=

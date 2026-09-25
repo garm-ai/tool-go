@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/garm-ai/garm/contracts/wire"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
 	"google.golang.org/protobuf/proto"
@@ -89,24 +90,19 @@ func (s *Service) Endpoint(ref toolbind.ToolRef, newRequest func() proto.Message
 	return nil
 }
 
-// Subject is the NATS subject a route is served on.
+// Subject and QueueGroup are re-exported from the contract rather than
+// reimplemented here.
 //
-// The FullMethod with its separators swapped for dots, so the subject and the
-// route are the same string in two syntaxes and neither side has a mapping
-// table to get wrong.
-func Subject(fullMethod string) string {
-	return strings.ReplaceAll(strings.TrimPrefix(fullMethod, "/"), "/", ".")
-}
-
-// QueueGroup is what replicas of a service share so NATS balances across them.
-// The proto service name: every replica of one service, and nothing else.
-func QueueGroup(fullMethod string) string {
-	trimmed := strings.TrimPrefix(fullMethod, "/")
-	if i := strings.Index(trimmed, "/"); i >= 0 {
-		return trimmed[:i]
-	}
-	return trimmed
-}
+// They used to be implemented in this file AND in the daemon, identically, in
+// different repositories, with nothing keeping them that way. The symptom of
+// a divergence is a call that goes nowhere — one side publishing where the
+// other never subscribed — and no amount of contract hashing catches it,
+// because both sides can agree perfectly about a message while disagreeing
+// about where to send it.
+var (
+	Subject    = wire.Subject
+	QueueGroup = wire.QueueGroup
+)
 
 // Run serves until ctx is done, then drains.
 //
@@ -162,7 +158,7 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 		// The queue group is set explicitly to the proto service name, which
 		// is what makes NATS balance across replicas of one service and only
 		// that service.
-		if err := svc.AddEndpoint(endpointName(subject),
+		if err := svc.AddEndpoint(wire.MicroServiceName(subject),
 			micro.HandlerFunc(func(r micro.Request) { s.handle(ctx, e, r) }),
 			micro.WithEndpointSubject(subject),
 			micro.WithEndpointQueueGroup(e.ref.Service),
@@ -205,14 +201,4 @@ func (s *Service) handle(ctx context.Context, e endpoint, r micro.Request) {
 		return
 	}
 	_ = r.Respond(body)
-}
-
-// endpointName is what $SRV.INFO shows for a subject.
-//
-// Underscored because micro rejects a dot in a name, and derived from the
-// whole subject rather than the method because two proto services in one
-// process would otherwise both offer an endpoint called "Get" — and it is the
-// SECOND registration that fails, long after the first looked fine.
-func endpointName(subject string) string {
-	return strings.ReplaceAll(subject, ".", "_")
 }
