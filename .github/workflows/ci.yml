@@ -47,8 +47,15 @@ jobs:
       # protobuf is what makes choosing a different runtime possible later.
       - name: toolbind stays thin
         run: |
-          if go list -deps ./toolbind 2>/dev/null | grep -E 'nats|garm-ai'; then
+          # -deps includes the package itself, so it is filtered out. A guard
+          # that fires on its own subject is worse than no guard: the first
+          # response to a false positive is to weaken it.
+          leaked=$(go list -deps ./toolbind 2>/dev/null \
+            | grep -v '^github.com/garm-ai/tool-go/toolbind$' \
+            | grep -E 'nats|garm-ai' || true)
+          if [ -n "$leaked" ]; then
             echo "::error::toolbind reached beyond protobuf; it is linked by every tool service" >&2
+            echo "$leaked" >&2
             exit 1
           fi
           echo "clean: toolbind depends on protobuf and nothing else"
