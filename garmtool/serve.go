@@ -186,11 +186,18 @@ func (s *Service) handle(ctx context.Context, e endpoint, r micro.Request) {
 		_ = r.Error("500", err.Error(), nil)
 		return
 	}
-	if resp == nil {
+	if resp == nil || !resp.ProtoReflect().IsValid() {
 		// Returning (nil, nil) would otherwise reply with an empty body the
 		// daemon would unmarshal into a zero-valued response — a successful
 		// call that returns nothing, which no caller can distinguish from a
 		// genuine empty result.
+		//
+		// IsValid as well as == nil, because those are two different nils and
+		// the one that actually reaches here is the second. Generated code
+		// adapts a typed handler by returning its result straight into a
+		// proto.Message, so a handler that returned (*pb.Reply)(nil) arrives
+		// as a NON-nil interface holding a nil pointer — which proto.Marshal
+		// encodes to zero bytes without complaining.
 		_ = r.Error("500", "handler returned no response and no error", nil)
 		return
 	}

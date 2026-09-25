@@ -59,3 +59,18 @@ jobs:
             exit 1
           fi
           echo "clean: toolbind depends on protobuf and nothing else"
+
+      # The tests run an embedded NATS server, because the failures worth
+      # catching here are only visible to a caller on the wire. That server
+      # must stay in the tests: linking it from the runtime would put a
+      # broker in the build of every tool service that imports garmtool.
+      #
+      # go list -deps excludes test files, so anything it reports is a real
+      # import from shipping code.
+      - name: the test server stays in the tests
+        run: |
+          if go list -deps ./... 2>/dev/null | grep -E 'nats-io/nats-server'; then
+            echo "::error::a shipping package imports the embedded test server" >&2
+            exit 1
+          fi
+          echo "clean: nats-server is reachable from tests only"
