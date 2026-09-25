@@ -29,8 +29,15 @@ type Service struct {
 	name    string
 	version string
 
-	mu      sync.Mutex
-	methods map[string]toolbind.Method // by FullMethod
+	mu   sync.Mutex
+	eps  map[string]endpoint // by subject
+	hash string              // the DescriptorHash every binding agreed on
+}
+
+type endpoint struct {
+	ref        toolbind.ToolRef
+	newRequest func() proto.Message
+	handle     toolbind.Handler
 }
 
 // New starts an empty service. Generated bindings register onto it, then Run
@@ -49,23 +56,36 @@ func New(name, version string) *Service {
 	return &Service{
 		name:    name,
 		version: strings.TrimPrefix(version, "v"),
-		methods: map[string]toolbind.Method{},
+		eps:     map[string]endpoint{},
 	}
 }
 
-// Register implements toolbind.Registrar.
-func (s *Service) Register(service string, m toolbind.Method) error {
-	if m.FullMethod == "" || m.NewRequest == nil || m.Handle == nil {
-		return fmt.Errorf("registering %s: a method needs a route, a constructor and a handler", service)
+// Endpoint implements toolbind.Registrar.
+func (s *Service) Endpoint(ref toolbind.ToolRef, newRequest func() proto.Message, h toolbind.Handler) error {
+	if ref.Subject == "" || newRequest == nil || h == nil {
+		return fmt.Errorf("registering %s: an endpoint needs a subject, a constructor and a handler", ref.FQN)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, dup := s.methods[m.FullMethod]; dup {
-		// Registering twice means two handlers claim one route and the second
-		// silently wins. Refuse at startup rather than serve a coin flip.
-		return fmt.Errorf("%s is registered twice", m.FullMethod)
+	if _, dup := s.eps[ref.Subject]; dup {
+		// Two handlers claiming one subject means the second silently wins.
+		// Refuse at startup rather than serve a coin flip.
+		return fmt.Errorf("%s is registered twice", ref.Subject)
 	}
-	s.methods[m.FullMethod] = m
+
+	// Every binding in one process must agree on the descriptor hash, because
+	// the process advertises ONE and a daemon compares it against the
+	// catalogue. Two contracts in one service would make that advertisement a
+	// half-truth, and the half it omitted is the half that drifted.
+	if s.hash == "" {
+		s.hash = ref.DescriptorHash
+	} else if ref.DescriptorHash != "" && ref.DescriptorHash != s.hash {
+		return fmt.Errorf("%s was generated from a different contract than the tools "+
+			"already registered (%s vs %s); one process serves one contract",
+			ref.FQN, ref.DescriptorHash, s.hash)
+	}
+
+	s.eps[ref.Subject] = endpoint{ref: ref, newRequest: newRequest, handle: h}
 	return nil
 }
 
@@ -96,28 +116,42 @@ func QueueGroup(fullMethod string) string {
 // non-idempotent is the worst answer available.
 func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	s.mu.Lock()
-	methods := make(map[string]toolbind.Method, len(s.methods))
-	for k, v := range s.methods {
-		methods[k] = v
+	eps := make(map[string]endpoint, len(s.eps))
+	for k, v := range s.eps {
+		eps[k] = v
 	}
+	hash := s.hash
 	s.mu.Unlock()
 
-	if len(methods) == 0 {
+	if len(eps) == 0 {
 		return errors.New("no tools registered: a service with nothing to serve is never intended")
 	}
 
+	// Advertised so a daemon can reconcile what is running against the
+	// catalogue it loaded, from $SRV.INFO rather than from a promise. The key
+	// is what garmd's discovery reads into Service.Identity, which it treats
+	// as opaque — it compares, it does not interpret.
+	var contract string
+	for _, e := range eps {
+		contract = e.ref.ContractVersion
+		break
+	}
 	cfg := micro.Config{
 		Name:        s.name,
 		Version:     s.version,
-		Description: fmt.Sprintf("%d tool(s)", len(methods)),
+		Description: fmt.Sprintf("%d tool(s)", len(eps)),
+		Metadata: map[string]string{
+			"garm.identity":         hash,
+			"garm.contract_version": contract,
+		},
 	}
 	svc, err := micro.AddService(nc, cfg)
 	if err != nil {
 		return fmt.Errorf("registering the micro service: %w", err)
 	}
 
-	for route, m := range methods {
-		m := m
+	for subject, e := range eps {
+		e := e
 		// Endpoints go on the service directly, with the full subject.
 		//
 		// Not via AddGroup: a group PREFIXES the subject it is given, so a
@@ -128,12 +162,12 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 		// The queue group is set explicitly to the proto service name, which
 		// is what makes NATS balance across replicas of one service and only
 		// that service.
-		if err := svc.AddEndpoint(endpointName(route),
-			micro.HandlerFunc(func(r micro.Request) { s.handle(ctx, m, r) }),
-			micro.WithEndpointSubject(Subject(route)),
-			micro.WithEndpointQueueGroup(QueueGroup(route)),
+		if err := svc.AddEndpoint(endpointName(subject),
+			micro.HandlerFunc(func(r micro.Request) { s.handle(ctx, e, r) }),
+			micro.WithEndpointSubject(subject),
+			micro.WithEndpointQueueGroup(e.ref.Service),
 		); err != nil {
-			return fmt.Errorf("serving %s: %w", route, err)
+			return fmt.Errorf("serving %s: %w", e.ref.FQN, err)
 		}
 	}
 
@@ -141,8 +175,8 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	return svc.Stop()
 }
 
-func (s *Service) handle(ctx context.Context, m toolbind.Method, r micro.Request) {
-	req := m.NewRequest()
+func (s *Service) handle(ctx context.Context, e endpoint, r micro.Request) {
+	req := e.newRequest()
 	if err := proto.Unmarshal(r.Data(), req); err != nil {
 		// The daemon marshalled this from a descriptor in its catalogue. A
 		// failure here means the two are looking at different schemas, which
@@ -151,7 +185,7 @@ func (s *Service) handle(ctx context.Context, m toolbind.Method, r micro.Request
 		return
 	}
 
-	resp, err := m.Handle(ctx, req)
+	resp, err := e.handle(ctx, req)
 	if err != nil {
 		_ = r.Error("500", err.Error(), nil)
 		return
@@ -173,12 +207,12 @@ func (s *Service) handle(ctx context.Context, m toolbind.Method, r micro.Request
 	_ = r.Respond(body)
 }
 
-// endpointName is what $SRV.INFO shows for a route.
+// endpointName is what $SRV.INFO shows for a subject.
 //
-// Underscored rather than dotted because micro rejects a dot in a name, and
-// the full route rather than just the method because two proto services in
-// one process would otherwise both offer an endpoint called "Get" — and the
-// second registration is what fails, long after the first looked fine.
-func endpointName(route string) string {
-	return strings.ReplaceAll(Subject(route), ".", "_")
+// Underscored because micro rejects a dot in a name, and derived from the
+// whole subject rather than the method because two proto services in one
+// process would otherwise both offer an endpoint called "Get" — and it is the
+// SECOND registration that fails, long after the first looked fine.
+func endpointName(subject string) string {
+	return strings.ReplaceAll(subject, ".", "_")
 }
