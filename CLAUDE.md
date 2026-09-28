@@ -49,6 +49,11 @@ beside this one at `../spec/docs/superpowers/`.
 
 ## Not built
 
-Health, drain ordering, structured errors, middleware, cancellation,
-idempotency, the conformance suite, and the scaffold templates. `garmtool`
-today is the hop and the lifecycle around it.
+Health, drain ordering, middleware, cancellation, idempotency, the
+conformance suite, and the scaffold templates. `garmtool` today is the hop
+and the lifecycle around it.
+
+A handler can name its own error code via `toolbind.CodedError{Code,
+Message}` — there is no taxonomy behind the code beyond that. Which strings
+mean what is garmd's contract with its callers, not something this package or
+its runtime defines.

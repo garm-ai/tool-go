@@ -16,6 +16,8 @@ import (
 	"github.com/nats-io/nats.go/micro"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/garm-ai/tool-go/toolbind"
 )
 
 // Three of the bugs this file exists for produced a service that started
@@ -358,6 +360,36 @@ func TestAMalformedRequestIsAnsweredRatherThanDropped(t *testing.T) {
 	}
 	if got := msg.Header.Get(micro.ErrorHeader); !strings.Contains(got, "contract") {
 		t.Errorf("error = %q, which does not point at the contract", got)
+	}
+}
+
+// The unit tests in serve_test.go drive CodedError through handle() directly;
+// this is the same behaviour observed the way a caller actually sees it — the
+// micro error code header on a reply that came back over a real broker.
+func TestAHandlerChosenCodeReachesTheWireAsTheMicroErrorCodeHeader(t *testing.T) {
+	nc := embeddedNATS(t)
+
+	notFound := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, toolbind.CodedError{Code: "404", Message: "not found"}
+	}
+
+	s := New("calculator", "v0.4.0")
+	if err := s.Endpoint(addRef(), newString, notFound); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	subject := wire.Subject(addRoute)
+	serve(t, s, nc, subject)
+
+	msg, err := requestWithContext(t, nc, subject, marshal(t, wrapperspb.String("a-1")))
+	if err != nil {
+		t.Fatalf("calling %s: %v", subject, err)
+	}
+	if got := msg.Header.Get(micro.ErrorCodeHeader); got != "404" {
+		t.Errorf("error code header = %q, want 404: the handler's own classification "+
+			"was dropped somewhere between here and the wire", got)
+	}
+	if got := msg.Header.Get(micro.ErrorHeader); got != "not found" {
+		t.Errorf("error header = %q, want %q", got, "not found")
 	}
 }
 

@@ -55,7 +55,9 @@ which is exactly the assumption the pool breaks:
   response — happen after `reqHandler` has already read `req.respondError`,
   so none of them are counted, and reading `req.respondError` from the
   goroutine while `reqHandler` reads it concurrently on the main path is
-  itself unsynchronised.
+  itself unsynchronised. A handler-chosen code from `toolbind.CodedError` is
+  the same case: it also answers from inside that goroutine, so it is just as
+  invisible to `$SRV.STATS` as an ordinary handler error is.
 
 So `$SRV.STATS` for an endpoint under this pool is correct only for its
 synchronous refusals (`429`, `503`); everything about how long a handler ran

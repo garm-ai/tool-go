@@ -340,13 +340,30 @@ func (s *Service) handle(ctx context.Context, e endpoint, r micro.Request) {
 			// The CODED message, not the wrapper's text: what the handler
 			// chose to publish is this, and the context it wrapped around it
 			// is for its own logs.
-			_ = r.Error(coded.Code, coded.Message, nil)
+			msg := coded.Message
+			if msg == "" {
+				// micro's request.Error refuses an empty description just as
+				// it refuses an empty code — it returns an error and never
+				// replies at all. A reply must always be sent, so a handler
+				// that named a code but no message gets the code back as its
+				// own description rather than leaving the caller to hang.
+				msg = coded.Code
+			}
+			_ = r.Error(coded.Code, msg, nil)
 			return
 		}
-		// Unclassified — including a CodedError with an empty code, which
-		// micro would put on the wire as no error header at all, leaving the
-		// daemon to unmarshal a body that is not a response.
-		_ = r.Error("500", err.Error(), nil)
+		// Unclassified — including a CodedError with an empty code. micro's
+		// request.Error refuses an empty code outright, returning an error
+		// and never replying, so treating one as coded here would leave the
+		// caller with no reply at all and a hang until its own deadline,
+		// not a 500.
+		desc := err.Error()
+		if desc == "" {
+			// The same refusal applies to an empty description on the 500
+			// path: an error whose Error() is "" must still produce a reply.
+			desc = "internal error"
+		}
+		_ = r.Error("500", desc, nil)
 		return
 	}
 	if resp == nil || !resp.ProtoReflect().IsValid() {

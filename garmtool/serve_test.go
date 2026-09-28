@@ -578,10 +578,11 @@ func TestAnUncodedHandlerErrorIsStillAFiveHundred(t *testing.T) {
 	}
 }
 
-// An empty code is a handler mistake, and micro would put an empty error code
-// header on the wire — which the daemon reads as "no error" and then fails to
-// unmarshal. 500 is the honest fallback: something went wrong and this service
-// did not classify it.
+// An empty code is a handler mistake, and NATS micro's request.Error refuses
+// an empty code outright — it returns an error and never replies at all,
+// which would leave the caller hanging until its own deadline rather than
+// seeing a failure. 500 is the honest fallback: something went wrong and this
+// service did not classify it.
 func TestACodedErrorWithNoCodeFallsBackToFiveHundred(t *testing.T) {
 	blank := func(context.Context, proto.Message) (proto.Message, error) {
 		return nil, toolbind.CodedError{Message: "something went wrong"}
@@ -590,11 +591,50 @@ func TestACodedErrorWithNoCodeFallsBackToFiveHundred(t *testing.T) {
 	r := call(t, blank, marshal(t, wrapperspb.String("2")))
 
 	if r.code != "500" {
-		t.Errorf("code = %q, want 500: an empty code reaches the daemon as no error "+
-			"at all, and the reply then fails to unmarshal", r.code)
+		t.Errorf("code = %q, want 500: an empty code would make micro refuse to "+
+			"reply at all, leaving the caller to hang until its own deadline", r.code)
 	}
 	if r.description != "something went wrong" {
 		t.Errorf("description = %q", r.description)
+	}
+}
+
+// micro's request.Error refuses an empty description exactly as it refuses
+// an empty code — no reply at all, and the caller hangs until its own
+// deadline. A handler that named a code but left Message unset must still
+// get a reply, so the code stands in for the description too.
+func TestACodedErrorWithNoMessageStillGetsAReply(t *testing.T) {
+	noMessage := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, toolbind.CodedError{Code: "404"}
+	}
+
+	r := call(t, noMessage, marshal(t, wrapperspb.String("a-1")))
+
+	if r.code != "404" {
+		t.Errorf("code = %q, want 404", r.code)
+	}
+	if r.description == "" {
+		t.Fatal("description is empty: micro would refuse to send this reply at " +
+			"all, leaving the caller to hang until its own deadline")
+	}
+}
+
+// The same guard applies on the 500 path: a handler error whose Error() is
+// empty must not become an empty description, or micro refuses the reply
+// outright and the caller hangs rather than sees a failure.
+func TestAHandlerErrorWithNoMessageStillGetsAReply(t *testing.T) {
+	blank := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, errors.New("")
+	}
+
+	r := call(t, blank, marshal(t, wrapperspb.String("2")))
+
+	if r.code != "500" {
+		t.Errorf("code = %q, want 500", r.code)
+	}
+	if r.description == "" {
+		t.Fatal("description is empty: micro would refuse to send this reply at " +
+			"all, leaving the caller to hang until its own deadline")
 	}
 }
 

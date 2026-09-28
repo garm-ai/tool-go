@@ -35,7 +35,9 @@ The same boundary means your build does not inherit garm's dependency tree.
 ## Status
 
 Early. `toolbind` and a NATS runtime that serves registered tools and drains
-on shutdown. Health, structured errors, middleware, cancellation, idempotency
+on shutdown. A handler can name its own error code via `toolbind.CodedError`
+— which strings mean what is garmd's contract with its callers, not a
+taxonomy this package invents. Health, middleware, cancellation, idempotency
 and the conformance suite are not built.
 
 MIT licensed.

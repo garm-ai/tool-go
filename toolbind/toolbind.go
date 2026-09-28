@@ -98,17 +98,29 @@ type Registrar interface {
 // whether it was returned bare or wrapped with %w. Wrapping is the ordinary
 // way a handler adds context for its own logs, and a code that survived only
 // the bare form would work for the half of the handlers nobody writes.
+//
+// Return it by value, not as *CodedError: errors.As(err, &coded) with a
+// CodedError target matches a CodedError, bare or wrapped, but not a
+// *CodedError — a handler that returned one of those would find its code
+// silently dropped rather than published.
 type CodedError struct {
 	// Code is the micro error code, e.g. "404". An empty one is treated as
-	// unclassified by the runtime and answered "500": an empty code header
-	// reaches the daemon as no error at all, and the reply body then fails to
-	// unmarshal into the declared response.
+	// unclassified by the runtime and answered "500": NATS micro's
+	// request.Error refuses an empty code outright — it returns an error and
+	// never calls RespondMsg — so replying with one directly would not be a
+	// bad reply, it would be no reply at all, leaving the caller to hang
+	// until its own deadline rather than see a failure.
 	Code string
 
 	// Message is what the caller is told, and what Error() returns. It is
 	// published verbatim, so it must not carry anything the caller is not
 	// entitled to see — this side of the hop does no redaction, and the
 	// daemon's sanitizer never sees an error.
+	//
+	// An empty Message is replaced by Code before it reaches the wire: micro
+	// refuses an empty description exactly as it refuses an empty code —
+	// returning an error and never replying — and a reply must always be
+	// sent.
 	Message string
 }
 
