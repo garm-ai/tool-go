@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -349,5 +351,210 @@ func TestAMalformedRequestIsAnsweredRatherThanDropped(t *testing.T) {
 	}
 	if got := msg.Header.Get(micro.ErrorHeader); !strings.Contains(got, "contract") {
 		t.Errorf("error = %q, which does not point at the contract", got)
+	}
+}
+
+// The endpoint sheds rather than queues.
+//
+// A NATS subscription delivers to its handler sequentially, so before the pool
+// existed a blocked handler blocked the endpoint and every caller waited out
+// its own timeout — a throughput ceiling that scaled with handler latency
+// rather than with the machine, and nothing in the API said so. Shedding is
+// the honest answer: the caller learns immediately, and retries or scales the
+// service out.
+func TestAnEndpointAtCapacityRefusesRatherThanQueues(t *testing.T) {
+	nc := embeddedNATS(t)
+
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	releaseAll := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseAll)
+
+	block := func(context.Context, proto.Message) (proto.Message, error) {
+		entered <- struct{}{}
+		<-release
+		return wrapperspb.String("done"), nil
+	}
+
+	s := New("calculator", "v0.1.0", WithConcurrency(1))
+	if err := s.Endpoint(addRef(), newString, block); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	subject := wire.Subject(addRoute)
+	serve(t, s, nc, subject)
+
+	// The first call occupies the only slot. Built here and sent from the
+	// goroutine, because t.Fatal from a non-test goroutine is not allowed.
+	enc, err := callctx.Encode(anInvocation())
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := nats.NewMsg(subject)
+	busy.Data = marshal(t, wrapperspb.String("one"))
+	busy.Header.Set(callctx.Header, enc)
+	first := make(chan error, 1)
+	go func() {
+		_, err := nc.RequestMsg(busy, 30*time.Second)
+		first <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first request never reached the handler")
+	}
+
+	msg, err := requestWithContext(t, nc, subject, marshal(t, wrapperspb.String("two")))
+	if err != nil {
+		t.Fatalf("the second call got no answer at all: %v", err)
+	}
+	if code := msg.Header.Get(micro.ErrorCodeHeader); code != "429" {
+		t.Fatalf("code = %q, want 429: the endpoint queued behind a busy handler "+
+			"instead of shedding", code)
+	}
+	if got := msg.Header.Get(micro.ErrorHeader); got != "overloaded" {
+		t.Errorf("description = %q, want %q", got, "overloaded")
+	}
+	if len(entered) != 0 {
+		t.Error("the refused request still reached the handler")
+	}
+
+	// And the endpoint recovers: shedding must not be a state it stays in.
+	releaseAll()
+	if err := <-first; err != nil {
+		t.Fatalf("the first call: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		msg, err := requestWithContext(t, nc, subject, marshal(t, wrapperspb.String("three")))
+		if err == nil && msg.Header.Get(micro.ErrorCodeHeader) == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the endpoint never started answering again after the pool drained")
+		}
+	}
+}
+
+// The default applies to the two-argument form every existing service uses, so
+// upgrading the runtime is what removes the ceiling — not editing every main.
+func TestTheDefaultConcurrencyLetsTwoCallsRunAtOnce(t *testing.T) {
+	nc := embeddedNATS(t)
+
+	var inFlight atomic.Int64
+	var peak atomic.Int64
+	both := make(chan struct{})
+	var once sync.Once
+
+	overlap := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		n := inFlight.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		if n >= 2 {
+			once.Do(func() { close(both) })
+		}
+		select {
+		case <-both:
+		case <-time.After(5 * time.Second):
+		}
+		inFlight.Add(-1)
+		return wrapperspb.String("done"), nil
+	}
+
+	s := New("calculator", "v0.1.0")
+	if err := s.Endpoint(addRef(), newString, overlap); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	subject := wire.Subject(addRoute)
+	serve(t, s, nc, subject)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m := nats.NewMsg(subject)
+			m.Data = marshal(t, wrapperspb.String("x"))
+			enc, err := callctx.Encode(anInvocation())
+			if err != nil {
+				return
+			}
+			m.Header.Set(callctx.Header, enc)
+			_, _ = nc.RequestMsg(m, 30*time.Second)
+		}()
+	}
+	wg.Wait()
+
+	if peak.Load() < 2 {
+		t.Errorf("peak concurrency was %d; the endpoint still serialises every call, "+
+			"so throughput scales with handler latency and not with the machine",
+			peak.Load())
+	}
+}
+
+// Drain, not drop. A call cut off mid-flight is a call whose effect the caller
+// cannot determine, which for anything non-idempotent is the worst answer
+// available — so Run must not return while a pooled handler is still running.
+func TestRunWaitsForInFlightHandlersBeforeReturning(t *testing.T) {
+	nc := embeddedNATS(t)
+
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	slow := func(context.Context, proto.Message) (proto.Message, error) {
+		close(started)
+		time.Sleep(300 * time.Millisecond)
+		close(finished)
+		return wrapperspb.String("done"), nil
+	}
+
+	s := New("calculator", "v0.1.0")
+	if err := s.Endpoint(addRef(), newString, slow); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	subject := wire.Subject(addRoute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx, nc) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := nc.Request(subject, nil, 200*time.Millisecond); err == nil || !isNoResponder(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("nothing ever answered on %s", subject)
+		}
+	}
+
+	go func() {
+		m := nats.NewMsg(subject)
+		m.Data = marshal(t, wrapperspb.String("x"))
+		enc, err := callctx.Encode(anInvocation())
+		if err != nil {
+			return
+		}
+		m.Header.Set(callctx.Header, enc)
+		_, _ = nc.RequestMsg(m, 30*time.Second)
+	}()
+
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned")
+	}
+	select {
+	case <-finished:
+	default:
+		t.Error("Run returned while a handler was still running; the call was cut off mid-flight")
 	}
 }

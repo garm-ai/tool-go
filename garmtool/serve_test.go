@@ -502,3 +502,26 @@ func TestAnInvocationWithNoDeadlineLeavesTheHandlerUnbounded(t *testing.T) {
 		t.Error("a deadline was invented for a call that carried none")
 	}
 }
+
+// The two-argument form is what every existing service's main calls. Adding
+// options must not make it a compile error to upgrade.
+func TestTheTwoArgumentConstructorStillCompilesAndGetsTheDefault(t *testing.T) {
+	if got := New("calc", "v0.1.0").concurrency; got != DefaultConcurrency {
+		t.Errorf("concurrency = %d, want the default %d", got, DefaultConcurrency)
+	}
+	if got := New("calc", "v0.1.0", WithConcurrency(3)).concurrency; got != 3 {
+		t.Errorf("concurrency = %d, want 3", got)
+	}
+}
+
+// Zero and negative are configuration mistakes, and the failure they would
+// produce is a service that starts cleanly and answers 429 to everything.
+// Ignoring them leaves the default, which is the only safe reading.
+func TestANonPositiveConcurrencyLeavesTheDefault(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		if got := New("calc", "v0.1.0", WithConcurrency(n)).concurrency; got != DefaultConcurrency {
+			t.Errorf("WithConcurrency(%d) gave %d, want the default %d",
+				n, got, DefaultConcurrency)
+		}
+	}
+}

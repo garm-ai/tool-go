@@ -31,6 +31,10 @@ type Service struct {
 	name    string
 	version string
 
+	// concurrency bounds each endpoint's pool. Read once per Run, so a value
+	// changed after serving has begun does not apply to a live endpoint.
+	concurrency int
+
 	mu   sync.Mutex
 	eps  map[string]endpoint // by subject
 	hash string              // the DescriptorHash every binding agreed on
@@ -49,17 +53,22 @@ type endpoint struct {
 // implements the contract it has. Advertising one and implementing another is
 // the drift that reconciliation exists to catch, so it should come from the
 // build rather than from a literal.
-func New(name, version string) *Service {
+func New(name, version string, opts ...Option) *Service {
 	// NATS micro requires bare semver and rejects a leading "v", while a Go
 	// module version always carries one — so passing the obvious thing, the
 	// version of the module being served, would fail at startup with a
 	// message about SemVer that does not mention the v. Stripping it is
 	// kinder than explaining it.
-	return &Service{
-		name:    name,
-		version: strings.TrimPrefix(version, "v"),
-		eps:     map[string]endpoint{},
+	s := &Service{
+		name:        name,
+		version:     strings.TrimPrefix(version, "v"),
+		eps:         map[string]endpoint{},
+		concurrency: DefaultConcurrency,
 	}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // Endpoint implements toolbind.Registrar.
@@ -118,6 +127,7 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 		eps[k] = v
 	}
 	hash := s.hash
+	limit := s.concurrency
 	s.mu.Unlock()
 
 	if len(eps) == 0 {
@@ -147,8 +157,17 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 		return fmt.Errorf("registering the micro service: %w", err)
 	}
 
+	// One WaitGroup for the whole service: Run must not return while any
+	// handler is still running, whichever endpoint it belongs to.
+	var inFlight sync.WaitGroup
+
 	for subject, e := range eps {
 		e := e
+		// A slot per endpoint. Buffered, and taken with a non-blocking send:
+		// a blocking one would queue behind a busy handler, which is the
+		// ceiling this pool exists to remove rather than to move.
+		slots := make(chan struct{}, limit)
+
 		// Endpoints go on the service directly, with the full subject.
 		//
 		// Not via AddGroup: a group PREFIXES the subject it is given, so a
@@ -160,7 +179,24 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 		// is what makes NATS balance across replicas of one service and only
 		// that service.
 		if err := svc.AddEndpoint(wire.MicroServiceName(subject),
-			micro.HandlerFunc(func(r micro.Request) { s.handle(ctx, e, r) }),
+			micro.HandlerFunc(func(r micro.Request) {
+				select {
+				case slots <- struct{}{}:
+				default:
+					// Shed, immediately. A caller told "overloaded" retries or
+					// scales the service out; a caller left waiting learns the
+					// same thing from its own timeout, minutes later, with no
+					// way to tell an overloaded service from a hung one.
+					_ = r.Error("429", "overloaded", nil)
+					return
+				}
+				inFlight.Add(1)
+				go func() {
+					defer inFlight.Done()
+					defer func() { <-slots }()
+					s.handle(ctx, e, r)
+				}()
+			}),
 			micro.WithEndpointSubject(subject),
 			micro.WithEndpointQueueGroup(e.ref.Service),
 		); err != nil {
@@ -169,7 +205,12 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	}
 
 	<-ctx.Done()
-	return svc.Stop()
+	// Stop first, then wait. Stop drains: NATS stops delivering new requests
+	// to this instance, and the handlers already running finish. Waiting
+	// first would be waiting on a queue that is still being fed.
+	err = svc.Stop()
+	inFlight.Wait()
+	return err
 }
 
 // handle is one request: the invocation context first, then the message.
