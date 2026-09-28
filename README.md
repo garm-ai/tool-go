@@ -7,7 +7,7 @@ serving a governed tool is a handler body and a `main`, and nothing else.
 
 | | |
 |---|---|
-| `garmtool/` | Serve, lifecycle, health, drain, structured errors, middleware, cancellation, idempotency. |
+| `garmtool/` | Serve, lifecycle, drain, the invocation context, coded errors, and a bounded worker pool per endpoint. |
 | `testkit/` | The harness for testing your own tool service. |
 | `templates/` | What `garm new toolservice --lang go` writes. |
 | `conformance/` | Runs the suite published by [`garm`](../garm) against your service. |
@@ -34,10 +34,13 @@ The same boundary means your build does not inherit garm's dependency tree.
 
 ## Status
 
-Early. `toolbind` and a NATS runtime that serves registered tools and drains
-on shutdown. A handler can name its own error code via `toolbind.CodedError`
-— which strings mean what is garmd's contract with its callers, not a
-taxonomy this package invents. Health, middleware, cancellation, idempotency
-and the conformance suite are not built.
+Early, and useful. `toolbind` plus a NATS runtime that serves registered tools,
+decodes the `Garm-Invocation` context onto the handler's `ctx` and refuses a
+request without one, bounds each endpoint with a worker pool
+(`garmtool.WithConcurrency`, default 16), lets a handler name its own error
+code with `toolbind.CodedError`, and drains on shutdown.
+
+Health, middleware, idempotency and the conformance suite are not built. See
+`KNOWN-GAPS.md`.
 
 MIT licensed.

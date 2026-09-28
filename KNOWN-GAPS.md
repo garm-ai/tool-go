@@ -1,35 +1,31 @@
 # Known gaps
 
-## One request at a time, per endpoint
+## Built
 
-A tool endpoint currently handles exactly one request at a time. Measured:
-eight concurrent calls to a 150 ms handler peaked at a concurrency of **one**.
-
-It is not a bug so much as an inherited default. `micro` dispatches from a NATS
-async subscription, and a subscription delivers to its handler sequentially, so
-a handler that blocks blocks the endpoint. Nothing here spawns a goroutine or
-holds a worker pool.
-
-The consequence is a throughput ceiling that scales with handler latency rather
-than with the machine: a 150 ms handler serves about seven requests a second
-per endpoint, per process, whatever the box underneath. For a tool that calls a
-database or a payment scheme, that is the number that matters and it is
-currently invisible — nothing in the API or the docs says it.
-
-Two things follow for anyone reading this before it is fixed. Scale by running
-more instances of the service, since the queue group already balances across
-them. And do not assume a handler is single-threaded just because it is today:
-a worker pool here would be a small change, and code that relied on the
-serialisation would break silently rather than loudly.
-
-The fix is a bounded pool with a configurable size. The question worth
-answering first is the default, because raising it changes behaviour for every
-existing service at once — and unbounded concurrency would move the overload
-from this process to whatever the handler calls.
-
-**Fixed.** `garmtool.WithConcurrency(n)` bounds each endpoint's pool (default
-`DefaultConcurrency = 16`); at capacity an endpoint answers `429 overloaded`
-rather than queueing.
+- `toolbind` — the seam a generated binding registers against. Protobuf and
+  nothing else, because every tool service anyone writes links it.
+- `garmtool` — the NATS runtime: subscribe, decode the invocation context,
+  unmarshal, call the handler, marshal, reply, drain on shutdown. One
+  descriptor hash per process, advertised on `$SRV.INFO` so a daemon can
+  reconcile what is running against the catalogue it loaded.
+- **The invocation context is decoded and refused.** `Garm-Invocation`
+  (`garm/contracts/callctx`) is read off every request; absent or undecodable
+  is `400 missing invocation context` and the handler is never reached, because
+  a request carrying no context did not come through the chain. A context that
+  does arrive is on `ctx` for `callctx.FromContext`, and its absolute deadline
+  bounds the handler.
+- **Each endpoint has a bounded pool.** `garmtool.WithConcurrency(n)`, default
+  16, per endpoint rather than per service. At capacity an endpoint answers
+  `429 overloaded` rather than queueing: a caller told it is overloaded retries
+  or scales the service out, and a caller left waiting learns the same thing
+  from its own timeout with no way to tell an overloaded service from a hung
+  one. `Run` drains the pool before returning.
+- **A handler chooses its own error code.** `toolbind.CodedError{Code, Message}`
+  is the only way, and it lives in the seam rather than in the runtime so a
+  generated binding can name a code without importing one. The runtime finds it
+  with `errors.As`, so a handler that wrapped it with `%w` still publishes the
+  code it chose; everything else — an empty code included — is `500` plus the
+  handler's own words.
 
 ## Known limitation: `$SRV.STATS` is not meaningful for a pooled endpoint
 
@@ -64,6 +60,32 @@ synchronous refusals (`429`, `503`); everything about how long a handler ran
 or how it failed is invisible there. Anyone building `garmd`'s reconciliation
 or observability against `$SRV.STATS` needs to know this before relying on it
 — which is the reason this is recorded here rather than only in a commit that
-scrolls out of view. Task 3's rewrite of the transport carries this forward
-until stats are computed from where the handler actually finishes, not from
-where `Handle` returns.
+scrolls out of view. This remains true until stats are computed from where the
+handler actually finishes, not from where `Handle` returns.
+
+## Not built
+
+**Health, middleware, idempotency.** There is no per-call middleware chain and
+no idempotency key handling, so a non-idempotent tool retried by a caller runs
+twice.
+
+**There is no error taxonomy, only a way to name one.** `CodedError` publishes
+whatever string a handler puts in it, and nothing here says which codes mean
+what — that is the daemon's contract with its callers. A handler that invents a
+code nobody maps gets it forwarded verbatim, and the caller reads it as an
+unknown failure.
+
+**The pool sheds, it does not queue, and it does not measure.** There is no
+metric for how often an endpoint refused, so an operator learns about a
+too-small pool from callers rather than from a dashboard. The number to watch
+is `429`s per endpoint; nothing here emits it yet.
+
+**`testkit`, `templates` and `conformance` do not exist.** The README's table
+describes where they will live. Testing a handler today means calling it
+directly or running a service against an embedded broker, as this repository's
+own tests do.
+
+**Producer/consumer agreement with `garmd` is untested here.** That a real
+`garmd` and this runtime agree about the subject, the descriptor hash and the
+invocation context needs both sides, and neither may import the other. It
+belongs in a cross-repository test, not in a fake here and not in a skip.

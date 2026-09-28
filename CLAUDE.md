@@ -21,7 +21,7 @@ response. A handler here does the work and nothing else.
 | | |
 |---|---|
 | `toolbind/` | The seam a generated binding registers against. Protobuf and nothing else |
-| `garmtool/` | The runtime: subscribe, unmarshal, call, marshal, reply, drain |
+| `garmtool/` | The runtime: subscribe, decode the invocation context, unmarshal, call, marshal, reply, drain, behind a bounded worker pool per endpoint |
 
 **`toolbind` is linked by every tool service anyone writes**, so anything added
 to it is added to all of them. CI asserts it reaches nothing but protobuf.
@@ -49,9 +49,11 @@ beside this one at `../spec/docs/superpowers/`.
 
 ## Not built
 
-Health, drain ordering, middleware, cancellation, idempotency, the
-conformance suite, and the scaffold templates. `garmtool` today is the hop
-and the lifecycle around it.
+Health beyond what `micro` gives for free, middleware, idempotency, the
+conformance suite, and the scaffold templates. `garmtool` today is the hop —
+invocation context, dispatch through a bounded pool, drain — and the
+lifecycle around it. See `KNOWN-GAPS.md` for what changed and what is still
+missing, including the `$SRV.STATS` limitation the pool introduced.
 
 A handler can name its own error code via `toolbind.CodedError{Code,
 Message}` — there is no taxonomy behind the code beyond that. Which strings
