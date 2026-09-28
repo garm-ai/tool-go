@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -523,5 +524,93 @@ func TestANonPositiveConcurrencyLeavesTheDefault(t *testing.T) {
 			t.Errorf("WithConcurrency(%d) gave %d, want the default %d",
 				n, got, DefaultConcurrency)
 		}
+	}
+}
+
+// dispatch is where the stopping flag is read, so this drives that decision
+// directly rather than through a real NATS connection: end to end, the
+// window between svc.Stop returning and its subscription drain actually
+// taking effect is only as wide as NATS's own UNSUB round trip, which on a
+// local connection completes before a second request can be sent — not a
+// window a black-box test can reliably land in on demand.
+func TestADispatchThatFindsTheServiceStoppingRefusesRatherThanRuns(t *testing.T) {
+	s := New("calc", "v0.1.0", WithConcurrency(1))
+	if err := s.Endpoint(addRef(), newString, echo); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	s.stopping = true
+
+	slots := make(chan struct{}, 1)
+	var inFlight sync.WaitGroup
+	r := &recorder{
+		data:    marshal(t, wrapperspb.String("x")),
+		headers: invocationHeaders(t, anInvocation()),
+	}
+
+	s.dispatch(context.Background(), s.eps[addRef().Subject], r, slots, &inFlight)
+
+	if !r.errored {
+		t.Fatal("a request dispatched while the service was stopping was answered as a success")
+	}
+	if r.code != "503" {
+		t.Errorf("code = %q, want 503", r.code)
+	}
+	if r.description != "shutting down" {
+		t.Errorf("description = %q, want %q", r.description, "shutting down")
+	}
+	if len(slots) != 0 {
+		t.Error("the slot taken to check stopping was never released")
+	}
+
+	// inFlight.Add must never have been called: a WaitGroup nothing was
+	// added to returns from Wait immediately, so a Wait that blocks here
+	// would mean dispatch added to it despite refusing the request.
+	done := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("inFlight.Add was called for a request dispatch refused")
+	}
+}
+
+// The ordinary path through dispatch — not stopping, a free slot — is what
+// every other test exercises through Run; this pins that dispatch itself,
+// called directly, still runs the handler and both releases happen once it
+// returns.
+func TestADispatchThatAcquiresRunsTheHandlerAndReleasesBoth(t *testing.T) {
+	s := New("calc", "v0.1.0", WithConcurrency(1))
+	if err := s.Endpoint(addRef(), newString, echo); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+
+	slots := make(chan struct{}, 1)
+	var inFlight sync.WaitGroup
+	r := &recorder{
+		data:    marshal(t, wrapperspb.String("hello")),
+		headers: invocationHeaders(t, anInvocation()),
+	}
+
+	s.dispatch(context.Background(), s.eps[addRef().Subject], r, slots, &inFlight)
+
+	done := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("inFlight never reached zero; dispatch's goroutine did not finish or never called Done")
+	}
+
+	if !r.answered {
+		t.Fatalf("no reply; error was %q %q", r.code, r.description)
+	}
+	if len(slots) != 0 {
+		t.Error("the slot dispatch acquired was never released")
 	}
 }

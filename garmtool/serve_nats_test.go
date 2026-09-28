@@ -368,7 +368,6 @@ func TestAnEndpointAtCapacityRefusesRatherThanQueues(t *testing.T) {
 	entered := make(chan struct{}, 8)
 	release := make(chan struct{})
 	releaseAll := sync.OnceFunc(func() { close(release) })
-	t.Cleanup(releaseAll)
 
 	block := func(context.Context, proto.Message) (proto.Message, error) {
 		entered <- struct{}{}
@@ -382,6 +381,11 @@ func TestAnEndpointAtCapacityRefusesRatherThanQueues(t *testing.T) {
 	}
 	subject := wire.Subject(addRoute)
 	serve(t, s, nc, subject)
+	// Registered after serve, so cleanups run in the right order: serve's
+	// cleanup cancels Run's context and waits for it to return, which would
+	// hang forever if the blocked handler were released only afterwards.
+	// t.Cleanup runs LIFO, so registering this one last runs it first.
+	t.Cleanup(releaseAll)
 
 	// The first call occupies the only slot. Built here and sent from the
 	// goroutine, because t.Fatal from a non-test goroutine is not allowed.
@@ -518,6 +522,7 @@ func TestRunWaitsForInFlightHandlersBeforeReturning(t *testing.T) {
 	subject := wire.Subject(addRoute)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx, nc) }()
 
@@ -556,5 +561,78 @@ func TestRunWaitsForInFlightHandlersBeforeReturning(t *testing.T) {
 	case <-finished:
 	default:
 		t.Error("Run returned while a handler was still running; the call was cut off mid-flight")
+	}
+}
+
+// Handlers are dispatched under a context of their own, not Run's: Run's ctx
+// is cancelled the instant shutdown begins, and a handler that is honouring
+// ITS context correctly must not be cut off mid-flight just because that one
+// was — that would make "drain, not drop" false for the one kind of handler
+// it exists to protect.
+func TestAHandlersContextIsNotCancelledByRunsShutdown(t *testing.T) {
+	nc := embeddedNATS(t)
+
+	started := make(chan struct{})
+	sawCancelled := make(chan bool, 1)
+	slow := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		close(started)
+		// Long enough that Run's own ctx is certainly already cancelled by
+		// the time this reads it.
+		time.Sleep(200 * time.Millisecond)
+		sawCancelled <- ctx.Err() != nil
+		return wrapperspb.String("done"), nil
+	}
+
+	s := New("calculator", "v0.1.0")
+	if err := s.Endpoint(addRef(), newString, slow); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	subject := wire.Subject(addRoute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx, nc) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := nc.Request(subject, nil, 200*time.Millisecond); err == nil || !isNoResponder(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("nothing ever answered on %s", subject)
+		}
+	}
+
+	go func() {
+		m := nats.NewMsg(subject)
+		m.Data = marshal(t, wrapperspb.String("x"))
+		enc, err := callctx.Encode(anInvocation())
+		if err != nil {
+			return
+		}
+		m.Header.Set(callctx.Header, enc)
+		_, _ = nc.RequestMsg(m, 30*time.Second)
+	}()
+
+	<-started
+	cancel()
+
+	select {
+	case cancelled := <-sawCancelled:
+		if cancelled {
+			t.Error("the handler's context was already cancelled by Run's shutdown, mid-flight")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never reported its context state")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned")
 	}
 }

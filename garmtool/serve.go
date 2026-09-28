@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/garm-ai/garm/contracts/callctx"
 	"github.com/garm-ai/garm/contracts/wire"
@@ -38,6 +39,13 @@ type Service struct {
 	mu   sync.Mutex
 	eps  map[string]endpoint // by subject
 	hash string              // the DescriptorHash every binding agreed on
+
+	// stopping is set once Run has begun shutting down, before svc.Stop is
+	// even called. A dispatch that reads it true must not join inFlight: by
+	// the time it can be true, Run may already be waiting on inFlight (or
+	// past that wait), and an Add reaching it after Wait has started, or
+	// after Wait has returned, is the misuse the field exists to prevent.
+	stopping bool
 }
 
 type endpoint struct {
@@ -119,7 +127,10 @@ var (
 // Drain rather than close: NATS stops delivering new requests to this
 // instance while in-flight ones finish. A tool call cut off mid-flight is a
 // call whose effect the caller cannot determine, which for anything
-// non-idempotent is the worst answer available.
+// non-idempotent is the worst answer available — so a dispatched handler runs
+// under a context of its own, not ctx, and ctx being done does not reach it.
+// It gets up to DefaultDrainTimeout to finish on its own; only past that
+// deadline is its context cancelled too, so Run still returns.
 func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	s.mu.Lock()
 	eps := make(map[string]endpoint, len(s.eps))
@@ -161,6 +172,16 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	// handler is still running, whichever endpoint it belongs to.
 	var inFlight sync.WaitGroup
 
+	// A context of the handlers' own, not ctx: ctx is done the instant
+	// shutdown starts, and if handlers ran under it directly a
+	// context-respecting one would be cut off mid-flight the moment
+	// shutdown began, making the "drain, not drop" promise false for
+	// exactly the handler it was meant to protect. Cancelled only once the
+	// drain has had DefaultDrainTimeout to finish on its own, or sooner if
+	// it does.
+	drainCtx, cancelDrain := context.WithCancel(context.Background())
+	defer cancelDrain()
+
 	for subject, e := range eps {
 		e := e
 		// A slot per endpoint. Buffered, and taken with a non-blocking send:
@@ -180,22 +201,7 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 		// that service.
 		if err := svc.AddEndpoint(wire.MicroServiceName(subject),
 			micro.HandlerFunc(func(r micro.Request) {
-				select {
-				case slots <- struct{}{}:
-				default:
-					// Shed, immediately. A caller told "overloaded" retries or
-					// scales the service out; a caller left waiting learns the
-					// same thing from its own timeout, minutes later, with no
-					// way to tell an overloaded service from a hung one.
-					_ = r.Error("429", "overloaded", nil)
-					return
-				}
-				inFlight.Add(1)
-				go func() {
-					defer inFlight.Done()
-					defer func() { <-slots }()
-					s.handle(ctx, e, r)
-				}()
+				s.dispatch(drainCtx, e, r, slots, &inFlight)
 			}),
 			micro.WithEndpointSubject(subject),
 			micro.WithEndpointQueueGroup(e.ref.Service),
@@ -205,12 +211,76 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	}
 
 	<-ctx.Done()
-	// Stop first, then wait. Stop drains: NATS stops delivering new requests
+	// stopping first, under the lock the dispatcher reads it with, and
+	// strictly before Stop: only that order guarantees no dispatch reaching
+	// inFlight.Add after this goroutine reaches Wait below.
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
+	// Stop next, then wait. Stop drains: NATS stops delivering new requests
 	// to this instance, and the handlers already running finish. Waiting
 	// first would be waiting on a queue that is still being fed.
 	err = svc.Stop()
+
+	drained := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(DefaultDrainTimeout):
+	}
+	// Cancelling here is a no-op if the drain already finished (drainCtx has
+	// nothing left to bound) and forces the rest to return if it did not.
+	// Either way, this Wait is for whatever the deadline left running.
+	cancelDrain()
 	inFlight.Wait()
 	return err
+}
+
+// dispatch is one endpoint's gate in front of handle: acquire a slot, refuse
+// if the pool is full or the service is already stopping, otherwise run the
+// handler in a tracked goroutine and release both when it returns.
+//
+// Pulled out of Run's HandlerFunc closure so the stopping race has a seam a
+// test can drive directly — through Run and a real NATS connection, the
+// window this closes is open only for as long as NATS's own subscription
+// drain takes to reach the server, which on a local connection is not
+// reliably reproducible on demand.
+func (s *Service) dispatch(ctx context.Context, e endpoint, r micro.Request, slots chan struct{}, inFlight *sync.WaitGroup) {
+	select {
+	case slots <- struct{}{}:
+	default:
+		// Shed, immediately. A caller told "overloaded" retries or scales
+		// the service out; a caller left waiting learns the same thing from
+		// its own timeout, minutes later, with no way to tell an overloaded
+		// service from a hung one.
+		_ = r.Error("429", "overloaded", nil)
+		return
+	}
+
+	// NATS's own Subscription.Drain (inside svc.Stop, in Run) sends UNSUB
+	// and returns without waiting for it to take effect, so this can still
+	// run after Stop has returned and Run is already waiting on inFlight,
+	// or has already stopped waiting. stopping is set, under this same
+	// lock, before Stop is even called, so a dispatch that reads it true
+	// here never calls Add — closing that window rather than racing it.
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		<-slots
+		_ = r.Error("503", "shutting down", nil)
+		return
+	}
+	inFlight.Add(1)
+	s.mu.Unlock()
+
+	go func() {
+		defer inFlight.Done()
+		defer func() { <-slots }()
+		s.handle(ctx, e, r)
+	}()
 }
 
 // handle is one request: the invocation context first, then the message.

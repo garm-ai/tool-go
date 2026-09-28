@@ -1,5 +1,17 @@
 package garmtool
 
+import "time"
+
+// DefaultDrainTimeout bounds how long Run waits, once it has started
+// shutting down, for handlers already dispatched to finish on their own.
+//
+// Not exposed as an Option: the callers who would need something other than
+// "generous" are the ones whose handler ignores context cancellation
+// entirely, and a config knob would invite tuning that around rather than
+// fixing the handler. After the timeout, Run cancels the handlers' context
+// itself so it still returns.
+const DefaultDrainTimeout = 30 * time.Second
+
 // DefaultConcurrency is how many handler calls one endpoint runs at once when
 // nothing says otherwise.
 //
