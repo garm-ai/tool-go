@@ -17,14 +17,15 @@
   bounds the handler. A context with no deadline leaves the handler
   otherwise unbounded by this package.
 - **Each endpoint has a bounded pool.** `garmtool.WithConcurrency(n)`, default
-  16, per endpoint rather than per service. At capacity an endpoint answers
-  `429 overloaded` rather than queueing: a caller told it is overloaded retries
-  or scales the service out, and a caller left waiting learns the same thing
-  from its own timeout with no way to tell an overloaded service from a hung
-  one. A request that instead arrives after `Run` has begun shutting down is
-  `503 shutting down`, regardless of whether a slot was free — a delivery
-  that reached this instance after shutdown started is told so rather than
-  served on borrowed time. `Run` drains the pool before returning.
+  16, per endpoint rather than per service. A slot is acquired first: at
+  capacity an endpoint answers `429 overloaded` rather than queueing,
+  regardless of whether `Run` has begun shutting down — a caller told it is
+  overloaded retries or scales the service out, and a caller left waiting
+  learns the same thing from its own timeout with no way to tell an
+  overloaded service from a hung one. Only once a slot is acquired is
+  shutdown checked: a request that gets a free slot while `Run` is shutting
+  down is answered `503 shutting down` instead of being dispatched. `Run`
+  drains the pool before returning.
 - **A handler chooses its own error code.** `toolbind.CodedError{Code, Message}`
   is the only way, and it lives in the seam rather than in the runtime so a
   generated binding can name a code without importing one. The runtime finds it

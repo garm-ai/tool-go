@@ -73,11 +73,11 @@ func main() {
   otherwise unbounded by this package.
 - **Then the pool.** Each endpoint dispatches through a slot pool sized by
   `garmtool.WithConcurrency(n)` (`DefaultConcurrency = 16`), per endpoint
-  rather than per service. A request that arrives with every slot taken is
-  answered `429 overloaded` immediately, never queued. A request that
-  arrives after `Run` has begun shutting down is answered `503 shutting
-  down` instead, whether or not a slot was free — shutdown takes priority
-  over capacity.
+  rather than per service. A slot is acquired first: a full pool answers
+  `429 overloaded` immediately, never queued, regardless of whether `Run`
+  has begun shutting down. Only once a slot is acquired does shutdown get
+  checked — a request that gets a free slot while `Run` is shutting down is
+  answered `503 shutting down` instead of being dispatched.
 - **Then the message and the handler.** A request body that fails to
   unmarshal into the tool's request type is `400 request does not match the
   contract this service implements`. Otherwise the handler runs, and its
