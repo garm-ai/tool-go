@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/garm-ai/garm/contracts/callctx"
 	"github.com/garm-ai/garm/contracts/wire"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
@@ -171,7 +172,32 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	return svc.Stop()
 }
 
+// handle is one request: the invocation context first, then the message.
+//
+// The context comes first because it decides whether there is a request at
+// all. garmd sets Garm-Invocation on every hop (program plan §3.5), so a
+// request without one did not come through the chain, and unmarshalling it
+// before refusing would only be work done for a caller nobody identified.
 func (s *Service) handle(ctx context.Context, e endpoint, r micro.Request) {
+	ic, err := callctx.Decode(r.Headers().Get(callctx.Header))
+	if err != nil {
+		// One message for absent and for malformed, deliberately. Telling a
+		// caller which of the two it got says whether the header name was
+		// right, which is the first thing anyone probing would want to know.
+		// The detail is the daemon's to log, not this service's to publish.
+		_ = r.Error("400", "missing invocation context", nil)
+		return
+	}
+	ctx = callctx.NewContext(ctx, ic)
+	// Absolute, so it does not restart on this hop. A relative deadline
+	// re-based here would let a chain of three hops take three times what the
+	// caller allowed.
+	if d := ic.GetDeadline(); d != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, d.AsTime())
+		defer cancel()
+	}
+
 	req := e.newRequest()
 	if err := proto.Unmarshal(r.Data(), req); err != nil {
 		// The daemon marshalled this from a descriptor in its catalogue. A

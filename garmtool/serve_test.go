@@ -5,11 +5,15 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/garm-ai/garm/contracts/callctx"
+	toolv1 "github.com/garm-ai/garm/contracts/garm/tool/v1"
 	"github.com/garm-ai/garm/contracts/wire"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/garm-ai/tool-go/toolbind"
@@ -42,9 +46,10 @@ func echo(_ context.Context, req proto.Message) (proto.Message, error) {
 // recorder stands in for a micro.Request so the handler's decisions can be
 // read back without a server. Only what the handler touches is implemented;
 // the rest panics rather than returning a zero value, because a silently
-// empty Headers() would make a future test pass for the wrong reason.
+// empty answer would make a future test pass for the wrong reason.
 type recorder struct {
-	data []byte
+	data    []byte
+	headers micro.Headers
 
 	code, description string
 	body              []byte
@@ -63,18 +68,56 @@ func (r *recorder) Error(code, description string, _ []byte, _ ...micro.RespondO
 
 func (r *recorder) Data() []byte                               { return r.data }
 func (r *recorder) RespondJSON(any, ...micro.RespondOpt) error { panic("the handler marshals itself") }
-func (r *recorder) Headers() micro.Headers                     { panic("the handler reads no headers") }
 func (r *recorder) Subject() string                            { panic("the handler routes by registration") }
 func (r *recorder) Reply() string                              { panic("micro owns the reply subject") }
 
-// call drives the handler the way Run does, with one endpoint and one request.
+// Headers is what the runtime reads the invocation context off. A nil map is
+// a legitimate state — it is what a caller that set no headers produces — and
+// Get on one returns "", which is exactly the input the refusal below exists
+// for.
+func (r *recorder) Headers() micro.Headers { return r.headers }
+
+// anInvocation is what garmd puts on the wire: assertions about the caller,
+// never a credential. call_id is required — callctx.Decode refuses a context
+// without one, because code that needs the call id must notice its absence
+// rather than ledger an empty string.
+func anInvocation() *toolv1.InvocationContext {
+	return &toolv1.InvocationContext{
+		CallId: "call-1",
+		Attribution: &toolv1.CallContext{
+			Tenant:        "acme",
+			CorrelationId: "corr-1",
+		},
+		Principal: &toolv1.InvocationPrincipal{
+			Subject: "user:jdoe",
+			Kind:    toolv1.PrincipalKind_PRINCIPAL_KIND_USER,
+		},
+	}
+}
+
+func invocationHeaders(t *testing.T, ic *toolv1.InvocationContext) micro.Headers {
+	t.Helper()
+	enc, err := callctx.Encode(ic)
+	if err != nil {
+		t.Fatalf("encoding the invocation context: %v", err)
+	}
+	return micro.Headers{callctx.Header: []string{enc}}
+}
+
+// call drives the handler the way Run does, with one endpoint and one request
+// carrying the invocation context garmd sets on every hop.
 func call(t *testing.T, h toolbind.Handler, data []byte) *recorder {
+	t.Helper()
+	return callWithHeaders(t, h, data, invocationHeaders(t, anInvocation()))
+}
+
+func callWithHeaders(t *testing.T, h toolbind.Handler, data []byte, hdr micro.Headers) *recorder {
 	t.Helper()
 	s := New("calc", "v0.1.0")
 	if err := s.Endpoint(addRef(), newString, h); err != nil {
 		t.Fatalf("registering: %v", err)
 	}
-	r := &recorder{data: data}
+	r := &recorder{data: data, headers: hdr}
 	s.handle(context.Background(), s.eps[addRef().Subject], r)
 	return r
 }
@@ -316,5 +359,146 @@ func TestTheNamingIsTheContractsAndNotACopy(t *testing.T) {
 	}
 	if QueueGroup(addRoute) != wire.QueueGroup(addRoute) {
 		t.Errorf("QueueGroup diverged from the contract: %q vs %q", QueueGroup(addRoute), wire.QueueGroup(addRoute))
+	}
+}
+
+// garmd sets this header on every hop. A request without one did not come
+// through the chain — nobody authenticated it, nobody authorised it, nobody
+// will ledger it — and a tool that served it anyway would be the unpoliced
+// door the whole architecture exists to remove.
+func TestARequestWithNoInvocationContextIsRefusedAndTheHandlerIsNeverCalled(t *testing.T) {
+	var called bool
+	seen := func(context.Context, proto.Message) (proto.Message, error) {
+		called = true
+		return wrapperspb.String("x"), nil
+	}
+
+	r := callWithHeaders(t, seen, marshal(t, wrapperspb.String("hi")), nil)
+
+	if called {
+		t.Error("the handler ran for a request carrying no invocation context")
+	}
+	if !r.errored {
+		t.Fatal("a request with no invocation context was answered as a success")
+	}
+	if r.code != "400" {
+		t.Errorf("code = %q, want 400: the caller sent a malformed request, this "+
+			"service did not fail", r.code)
+	}
+	if r.description != "missing invocation context" {
+		t.Errorf("description = %q, want %q", r.description, "missing invocation context")
+	}
+}
+
+// A header that is present and unreadable is the same refusal as an absent
+// one. It is attacker-reachable the moment NATS subject permissions are
+// misconfigured, so it must never become a half-built context a handler
+// trusts.
+func TestAnUndecodableInvocationContextIsRefused(t *testing.T) {
+	for _, c := range []struct{ name, value string }{
+		{"not base64", "!!! not base64 !!!"},
+		{"not a protobuf", "/////////w=="},
+		{"no call id", func() string {
+			enc, err := callctx.Encode(&toolv1.InvocationContext{
+				Principal: &toolv1.InvocationPrincipal{Subject: "user:jdoe"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return enc
+		}()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var called bool
+			seen := func(context.Context, proto.Message) (proto.Message, error) {
+				called = true
+				return wrapperspb.String("x"), nil
+			}
+
+			r := callWithHeaders(t, seen, marshal(t, wrapperspb.String("hi")),
+				micro.Headers{callctx.Header: []string{c.value}})
+
+			if called {
+				t.Error("the handler ran for an undecodable invocation context")
+			}
+			if r.code != "400" || r.description != "missing invocation context" {
+				t.Errorf("answered %q %q, want 400 \"missing invocation context\"",
+					r.code, r.description)
+			}
+		})
+	}
+}
+
+// The context is the whole point of the header: a handler that needs to know
+// who it is acting for reads it from ctx, and nowhere else. It never carries
+// the caller's token.
+func TestTheInvocationContextReachesTheHandler(t *testing.T) {
+	var got *toolv1.InvocationContext
+	seen := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		got = callctx.FromContext(ctx)
+		return wrapperspb.String("x"), nil
+	}
+
+	r := call(t, seen, marshal(t, wrapperspb.String("hi")))
+
+	if !r.answered {
+		t.Fatalf("no reply; error was %q %q", r.code, r.description)
+	}
+	if got == nil {
+		t.Fatal("callctx.FromContext returned nothing inside the handler")
+	}
+	if got.GetCallId() != "call-1" {
+		t.Errorf("call_id = %q, want call-1", got.GetCallId())
+	}
+	if got.GetPrincipal().GetSubject() != "user:jdoe" {
+		t.Errorf("subject = %q, want user:jdoe", got.GetPrincipal().GetSubject())
+	}
+	if got.GetPrincipal().GetKind() != toolv1.PrincipalKind_PRINCIPAL_KIND_USER {
+		t.Errorf("kind = %v, want USER", got.GetPrincipal().GetKind())
+	}
+	if got.GetAttribution().GetCorrelationId() != "corr-1" {
+		t.Errorf("correlation_id = %q; the ledger cannot join this call to its caller",
+			got.GetAttribution().GetCorrelationId())
+	}
+}
+
+// The deadline is ABSOLUTE and came from the caller, so it bounds the handler
+// rather than restarting on this hop. A handler that outlives it is doing work
+// for a caller that has already given up.
+func TestTheInvocationDeadlineBoundsTheHandlersContext(t *testing.T) {
+	want := time.Now().Add(2 * time.Second)
+	ic := anInvocation()
+	ic.Deadline = timestamppb.New(want)
+
+	var deadline time.Time
+	var ok bool
+	seen := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		deadline, ok = ctx.Deadline()
+		return wrapperspb.String("x"), nil
+	}
+
+	callWithHeaders(t, seen, marshal(t, wrapperspb.String("hi")), invocationHeaders(t, ic))
+
+	if !ok {
+		t.Fatal("the handler's context carried no deadline; the caller's bound was dropped")
+	}
+	if d := deadline.Sub(want); d > time.Second || d < -time.Second {
+		t.Errorf("deadline = %s, want %s", deadline, want)
+	}
+}
+
+// No deadline on the context is a legitimate state — garmd sets one only when
+// its own caller did — and must not become an instantly-expired handler.
+func TestAnInvocationWithNoDeadlineLeavesTheHandlerUnbounded(t *testing.T) {
+	var ok bool
+	seen := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		_, ok = ctx.Deadline()
+		return wrapperspb.String("x"), nil
+	}
+
+	call(t, seen, marshal(t, wrapperspb.String("hi")))
+
+	if ok {
+		t.Error("a deadline was invented for a call that carried none")
 	}
 }

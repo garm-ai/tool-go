@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/garm-ai/garm/contracts/callctx"
 	"github.com/garm-ai/garm/contracts/wire"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -83,6 +84,21 @@ func isNoResponder(err error) bool {
 	return err == nats.ErrNoResponders || strings.Contains(err.Error(), "no responders")
 }
 
+// requestWithContext publishes the way garmd does: the request bytes plus the
+// Garm-Invocation header the chain sets on every hop. Spelling the header out
+// in each test would let the two sides drift apart silently.
+func requestWithContext(t *testing.T, nc *nats.Conn, subject string, data []byte) (*nats.Msg, error) {
+	t.Helper()
+	enc, err := callctx.Encode(anInvocation())
+	if err != nil {
+		t.Fatalf("encoding the invocation context: %v", err)
+	}
+	m := nats.NewMsg(subject)
+	m.Data = data
+	m.Header.Set(callctx.Header, enc)
+	return nc.RequestMsg(m, 5*time.Second)
+}
+
 // The subject a caller publishes to is the one wire.Subject names, spelled
 // exactly. A group would have prefixed it with the service name and produced
 // calc.v1.Calculator.calc.v1.Calculator.Add, which subscribes fine, starts
@@ -101,7 +117,7 @@ func TestARequestReachesTheHandlerOnTheSubjectTheContractNames(t *testing.T) {
 	subject := wire.Subject(addRoute)
 	serve(t, s, nc, subject)
 
-	msg, err := nc.Request(subject, marshal(t, wrapperspb.String("hello")), 5*time.Second)
+	msg, err := requestWithContext(t, nc, subject, marshal(t, wrapperspb.String("hello")))
 	if err != nil {
 		t.Fatalf("calling %s: %v", subject, err)
 	}
@@ -190,8 +206,13 @@ func TestEveryRegisteredToolIsReachable(t *testing.T) {
 
 	for _, route := range routes {
 		subject := wire.Subject(route)
-		if _, err := nc.Request(subject, marshal(t, wrapperspb.String("x")), 5*time.Second); err != nil {
+		msg, err := requestWithContext(t, nc, subject, marshal(t, wrapperspb.String("x")))
+		if err != nil {
 			t.Errorf("calling %s: %v", subject, err)
+			continue
+		}
+		if code := msg.Header.Get(micro.ErrorCodeHeader); code != "" {
+			t.Errorf("%s answered %s: %s", subject, code, msg.Header.Get(micro.ErrorHeader))
 		}
 	}
 }
@@ -315,11 +336,18 @@ func TestAMalformedRequestIsAnsweredRatherThanDropped(t *testing.T) {
 	subject := wire.Subject(addRoute)
 	serve(t, s, nc, subject)
 
-	msg, err := nc.Request(subject, []byte{0xff, 0xff, 0xff, 0xff}, 5*time.Second)
+	// With the invocation context, so the 400 this asserts is the one the
+	// malformed body earns. A bare request would now be refused for its
+	// missing header before the bytes were ever parsed, and this test would go
+	// on passing without exercising what it is named for.
+	msg, err := requestWithContext(t, nc, subject, []byte{0xff, 0xff, 0xff, 0xff})
 	if err != nil {
 		t.Fatalf("calling %s: %v", subject, err)
 	}
 	if got := msg.Header.Get(micro.ErrorCodeHeader); got != "400" {
 		t.Errorf("error code = %q, want 400", got)
+	}
+	if got := msg.Header.Get(micro.ErrorHeader); !strings.Contains(got, "contract") {
+		t.Errorf("error = %q, which does not point at the contract", got)
 	}
 }
