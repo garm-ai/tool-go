@@ -51,9 +51,16 @@ func embeddedNATS(t *testing.T) *nats.Conn {
 // serve runs the service until the test ends and waits until it is actually
 // answering. Returning before the endpoints are subscribed would make every
 // test below race the goroutine and fail on the timing of the machine.
-func serve(t *testing.T, s *Service, nc *nats.Conn, probe string) {
+//
+// base is what Run is called with, defaulting to context.Background(); a test
+// checking what a caller's ctx carries into a handler supplies its own.
+func serve(t *testing.T, s *Service, nc *nats.Conn, probe string, base ...context.Context) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
+	root := context.Background()
+	if len(base) > 0 {
+		root = base[0]
+	}
+	ctx, cancel := context.WithCancel(root)
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx, nc) }()
 	t.Cleanup(func() {
@@ -561,6 +568,36 @@ func TestRunWaitsForInFlightHandlersBeforeReturning(t *testing.T) {
 	case <-finished:
 	default:
 		t.Error("Run returned while a handler was still running; the call was cut off mid-flight")
+	}
+}
+
+// The handlers' context is its own for cancellation, but not a stranger's for
+// values: a logger or a tracer a caller attached to Run's ctx must still reach
+// a handler, or the only way to get one there would be a package-level global.
+type ctxKey struct{}
+
+func TestAValueOnRunsContextReachesTheHandler(t *testing.T) {
+	nc := embeddedNATS(t)
+
+	var got any
+	seen := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		got = ctx.Value(ctxKey{})
+		return wrapperspb.String("done"), nil
+	}
+
+	s := New("calculator", "v0.1.0")
+	if err := s.Endpoint(addRef(), newString, seen); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	subject := wire.Subject(addRoute)
+	ctx := context.WithValue(context.Background(), ctxKey{}, "a-logger")
+	serve(t, s, nc, subject, ctx)
+
+	if _, err := requestWithContext(t, nc, subject, marshal(t, wrapperspb.String("x"))); err != nil {
+		t.Fatalf("calling %s: %v", subject, err)
+	}
+	if got != "a-logger" {
+		t.Errorf("ctx.Value(ctxKey{}) = %v, want %q: a value on Run's ctx did not reach the handler", got, "a-logger")
 	}
 }
 

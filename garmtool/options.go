@@ -9,7 +9,7 @@ import "time"
 // "generous" are the ones whose handler ignores context cancellation
 // entirely, and a config knob would invite tuning that around rather than
 // fixing the handler. After the timeout, Run cancels the handlers' context
-// itself so it still returns.
+// too, and returns once they exit.
 const DefaultDrainTimeout = 30 * time.Second
 
 // DefaultConcurrency is how many handler calls one endpoint runs at once when

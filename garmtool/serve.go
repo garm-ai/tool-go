@@ -61,6 +61,10 @@ type endpoint struct {
 // implements the contract it has. Advertising one and implementing another is
 // the drift that reconciliation exists to catch, so it should come from the
 // build rather than from a literal.
+//
+// A Service is single-use: Run sets stopping once shutdown begins and never
+// clears it, so a second Run on the same Service would refuse every request
+// immediately rather than serve. Call New again for a second run.
 func New(name, version string, opts ...Option) *Service {
 	// NATS micro requires bare semver and rejects a leading "v", while a Go
 	// module version always carries one — so passing the obvious thing, the
@@ -130,7 +134,8 @@ var (
 // non-idempotent is the worst answer available — so a dispatched handler runs
 // under a context of its own, not ctx, and ctx being done does not reach it.
 // It gets up to DefaultDrainTimeout to finish on its own; only past that
-// deadline is its context cancelled too, so Run still returns.
+// deadline is the handlers' context cancelled too, and Run returns once they
+// exit.
 func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	s.mu.Lock()
 	eps := make(map[string]endpoint, len(s.eps))
@@ -179,7 +184,13 @@ func (s *Service) Run(ctx context.Context, nc *nats.Conn) error {
 	// exactly the handler it was meant to protect. Cancelled only once the
 	// drain has had DefaultDrainTimeout to finish on its own, or sooner if
 	// it does.
-	drainCtx, cancelDrain := context.WithCancel(context.Background())
+	//
+	// WithoutCancel(ctx) rather than Background(): this must not inherit
+	// ctx's cancellation — that is the whole point above — but it should
+	// still carry whatever values a caller attached to Run's ctx, a logger or
+	// a tracer, so a handler running during drain sees the same values one
+	// running before shutdown began would have.
+	drainCtx, cancelDrain := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelDrain()
 
 	for subject, e := range eps {
@@ -320,6 +331,21 @@ func (s *Service) handle(ctx context.Context, e endpoint, r micro.Request) {
 
 	resp, err := e.handle(ctx, req)
 	if err != nil {
+		// The handler's own classification, when it gave one. errors.As
+		// rather than a type assertion, so a handler that wrapped its error
+		// with %w to add context for its own logs still publishes the code it
+		// chose.
+		var coded toolbind.CodedError
+		if errors.As(err, &coded) && coded.Code != "" {
+			// The CODED message, not the wrapper's text: what the handler
+			// chose to publish is this, and the context it wrapped around it
+			// is for its own logs.
+			_ = r.Error(coded.Code, coded.Message, nil)
+			return
+		}
+		// Unclassified — including a CodedError with an empty code, which
+		// micro would put on the wire as no error header at all, leaving the
+		// daemon to unmarshal a body that is not a response.
 		_ = r.Error("500", err.Error(), nil)
 		return
 	}

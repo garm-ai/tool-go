@@ -72,3 +72,44 @@ type Registrar interface {
 	// the concrete type and the runtime should not have to.
 	Endpoint(ref ToolRef, newRequest func() proto.Message, h Handler) error
 }
+
+// CodedError is how a handler chooses the error code its caller sees.
+//
+// It is the ONLY way. A runtime reads the code off this and off nothing else:
+// there is no registry of error types, no mapping table, and no inspection of
+// an error's text. Returning any other error means "500" plus that error's own
+// words, which is the right answer for a tool that broke and the wrong one for
+// a tool that answered.
+//
+// It lives HERE, in the seam, rather than in a runtime, because a generated
+// binding must be able to name a code without importing one — that is the
+// whole reason this package exists, and a handler that had to import garmtool
+// to say "404" would make choosing a different runtime later mean
+// regenerating.
+//
+// The codes are the transport's, not a taxonomy of this package's invention:
+// they are strings because NATS micro's error code header is a string, and
+// which strings mean what is the daemon's contract with its callers. "404" and
+// "400" are the two a tool usually needs — the thing asked about does not
+// exist, and the arguments will never be acceptable — and both are answers
+// rather than failures.
+//
+// A value type with a value receiver, so `errors.As(err, &coded)` finds one
+// whether it was returned bare or wrapped with %w. Wrapping is the ordinary
+// way a handler adds context for its own logs, and a code that survived only
+// the bare form would work for the half of the handlers nobody writes.
+type CodedError struct {
+	// Code is the micro error code, e.g. "404". An empty one is treated as
+	// unclassified by the runtime and answered "500": an empty code header
+	// reaches the daemon as no error at all, and the reply body then fails to
+	// unmarshal into the declared response.
+	Code string
+
+	// Message is what the caller is told, and what Error() returns. It is
+	// published verbatim, so it must not carry anything the caller is not
+	// entitled to see — this side of the hop does no redaction, and the
+	// daemon's sanitizer never sees an error.
+	Message string
+}
+
+func (e CodedError) Error() string { return e.Message }

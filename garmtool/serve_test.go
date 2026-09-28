@@ -3,6 +3,7 @@ package garmtool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -512,6 +513,88 @@ func TestTheTwoArgumentConstructorStillCompilesAndGetsTheDefault(t *testing.T) {
 	}
 	if got := New("calc", "v0.1.0", WithConcurrency(3)).concurrency; got != 3 {
 		t.Errorf("concurrency = %d, want 3", got)
+	}
+}
+
+// A handler with a more specific answer than "this service broke" can now give
+// it. The daemon reads the code off the reply header, so before this every
+// failure — a missing account, an argument the tool will never accept — was a
+// 500, and the caller could not tell a tool that was broken from a tool that
+// had answered.
+func TestAHandlerCanChooseTheErrorCode(t *testing.T) {
+	missing := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, toolbind.CodedError{Code: "404", Message: "no such account"}
+	}
+
+	r := call(t, missing, marshal(t, wrapperspb.String("a-1")))
+
+	if r.answered {
+		t.Fatal("a handler error was replied to as a success")
+	}
+	if r.code != "404" {
+		t.Errorf("code = %q, want 404: the handler's own classification was dropped", r.code)
+	}
+	if r.description != "no such account" {
+		t.Errorf("description = %q, want the handler's message", r.description)
+	}
+}
+
+// Wrapping is the ordinary way a handler adds context. Losing the code there
+// would mean the feature works only for handlers that return the error bare,
+// which is the half nobody writes.
+func TestAWrappedCodedErrorKeepsItsCode(t *testing.T) {
+	wrapping := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, fmt.Errorf("looking up the account: %w",
+			toolbind.CodedError{Code: "404", Message: "no such account"})
+	}
+
+	r := call(t, wrapping, marshal(t, wrapperspb.String("a-1")))
+
+	if r.code != "404" {
+		t.Errorf("code = %q, want 404", r.code)
+	}
+	// The CodedError's own message, not the wrapper's. What the handler chose
+	// to publish is the coded part; the context it added is for its own logs.
+	if r.description != "no such account" {
+		t.Errorf("description = %q, want the coded message", r.description)
+	}
+}
+
+// Everything else is still a 500 carrying the handler's words. A tool failing
+// for a reason it can state is the common case, and "500" alone is not
+// actionable — but neither is an invented code.
+func TestAnUncodedHandlerErrorIsStillAFiveHundred(t *testing.T) {
+	failing := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, errors.New("divide by zero")
+	}
+
+	r := call(t, failing, marshal(t, wrapperspb.String("2")))
+
+	if r.code != "500" {
+		t.Errorf("code = %q, want 500", r.code)
+	}
+	if r.description != "divide by zero" {
+		t.Errorf("description = %q; the handler's reason did not survive", r.description)
+	}
+}
+
+// An empty code is a handler mistake, and micro would put an empty error code
+// header on the wire — which the daemon reads as "no error" and then fails to
+// unmarshal. 500 is the honest fallback: something went wrong and this service
+// did not classify it.
+func TestACodedErrorWithNoCodeFallsBackToFiveHundred(t *testing.T) {
+	blank := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, toolbind.CodedError{Message: "something went wrong"}
+	}
+
+	r := call(t, blank, marshal(t, wrapperspb.String("2")))
+
+	if r.code != "500" {
+		t.Errorf("code = %q, want 500: an empty code reaches the daemon as no error "+
+			"at all, and the reply then fails to unmarshal", r.code)
+	}
+	if r.description != "something went wrong" {
+		t.Errorf("description = %q", r.description)
 	}
 }
 
