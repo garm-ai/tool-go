@@ -6,8 +6,9 @@
 // would be a second, unreviewed implementation of the chain in the one place
 // that must not have one.
 //
-// What this package owns is the hop: subscribe, unmarshal, call the handler,
-// marshal, reply. Plus the lifecycle around it.
+// What this package owns is the hop: subscribe, decode the invocation
+// context, unmarshal, call the handler, marshal, reply, behind a bounded
+// worker pool per endpoint. Plus the lifecycle around it.
 package garmtool
 
 import (

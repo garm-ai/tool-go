@@ -9,17 +9,22 @@
   descriptor hash per process, advertised on `$SRV.INFO` so a daemon can
   reconcile what is running against the catalogue it loaded.
 - **The invocation context is decoded and refused.** `Garm-Invocation`
-  (`garm/contracts/callctx`) is read off every request; absent or undecodable
-  is `400 missing invocation context` and the handler is never reached, because
-  a request carrying no context did not come through the chain. A context that
-  does arrive is on `ctx` for `callctx.FromContext`, and its absolute deadline
-  bounds the handler.
+  (`garm/contracts/callctx`) is read off every request; absent, undecodable,
+  or decodable but carrying no `call_id` is `400 missing invocation context`
+  and the handler is never reached, because a request carrying none of these
+  did not come through the chain. A context that does decode is on `ctx` for
+  `callctx.FromContext`; when it carries a deadline, that absolute deadline
+  bounds the handler. A context with no deadline leaves the handler
+  otherwise unbounded by this package.
 - **Each endpoint has a bounded pool.** `garmtool.WithConcurrency(n)`, default
   16, per endpoint rather than per service. At capacity an endpoint answers
   `429 overloaded` rather than queueing: a caller told it is overloaded retries
   or scales the service out, and a caller left waiting learns the same thing
   from its own timeout with no way to tell an overloaded service from a hung
-  one. `Run` drains the pool before returning.
+  one. A request that instead arrives after `Run` has begun shutting down is
+  `503 shutting down`, regardless of whether a slot was free — a delivery
+  that reached this instance after shutdown started is told so rather than
+  served on borrowed time. `Run` drains the pool before returning.
 - **A handler chooses its own error code.** `toolbind.CodedError{Code, Message}`
   is the only way, and it lives in the seam rather than in the runtime so a
   generated binding can name a code without importing one. The runtime finds it
@@ -80,10 +85,10 @@ metric for how often an endpoint refused, so an operator learns about a
 too-small pool from callers rather than from a dashboard. The number to watch
 is `429`s per endpoint; nothing here emits it yet.
 
-**`testkit`, `templates` and `conformance` do not exist.** The README's table
-describes where they will live. Testing a handler today means calling it
-directly or running a service against an embedded broker, as this repository's
-own tests do.
+**`testkit`, `templates` and `conformance` do not exist.** The README's
+"Planned, not built" list describes where they will live. Testing a handler
+today means calling it directly or running a service against an embedded
+broker, as this repository's own tests do.
 
 **Producer/consumer agreement with `garmd` is untested here.** That a real
 `garmd` and this runtime agree about the subject, the descriptor hash and the

@@ -47,13 +47,23 @@ beside this one at `../spec/docs/superpowers/`.
 
 **Do not create `docs/superpowers/` here.**
 
+## Lifecycle
+
+`Run(ctx, nc)` serves until `ctx` is done, then drains: in-flight handlers
+run under a context of their own, not `ctx`, for up to `DefaultDrainTimeout`
+(30s) before that context is cancelled too and `Run` returns. A `*Service`
+is single-use — `Run` marks it stopping once shutdown begins and never
+clears the mark, so a second `Run` on the same value refuses every request
+immediately rather than serving; call `New` again.
+
 ## Not built
 
-Health beyond what `micro` gives for free, middleware, idempotency, the
-conformance suite, and the scaffold templates. `garmtool` today is the hop —
-invocation context, dispatch through a bounded pool, drain — and the
-lifecycle around it. See `KNOWN-GAPS.md` for what changed and what is still
-missing, including the `$SRV.STATS` limitation the pool introduced.
+`testkit`, health beyond what `micro` gives for free, middleware,
+idempotency, the conformance suite, and the scaffold templates. `garmtool`
+today is the hop — invocation context, dispatch through a bounded pool,
+drain — and the lifecycle around it. See `KNOWN-GAPS.md` for what changed
+and what is still missing, including the `$SRV.STATS` limitation the pool
+introduced.
 
 A handler can name its own error code via `toolbind.CodedError{Code,
 Message}` — there is no taxonomy behind the code beyond that. Which strings
