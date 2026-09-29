@@ -54,8 +54,8 @@ func main() {
   `.proto` declares, each wired with the `Subject` it answers on
   (`Service.Method`, dotted, so nothing here or in `garmd` keeps a separate
   routing table) and the `QueueGroup` NATS balances replicas across (the
-  proto service name). Both are re-exported from `garm/contracts/wire`
-  rather than reimplemented, so this side and `garmd` cannot disagree about
+  proto service name). Both are re-exported from
+  `github.com/garm-ai/contracts/wire` rather than reimplemented, so this side and `garmd` cannot disagree about
   where a call goes.
 - **`svc.Run(ctx, nc)`** serves until `ctx` is done, then drains (below). It
   blocks; call it last.
@@ -63,8 +63,8 @@ func main() {
 ## What happens on each request
 
 - **The invocation context is decoded first.** `Garm-Invocation`
-  (`garm/contracts/callctx`) is read off the request headers before the body
-  is touched. Absent, undecodable, or decodable but carrying no `call_id` is
+  (`github.com/garm-ai/contracts/callctx`) is read off the request headers
+  before the body is touched. Absent, undecodable, or decodable but carrying no `call_id` is
   `400 missing invocation context`, and the handler is never called — a
   request carrying none of these did not come through the chain. A context
   that does decode lands on `ctx` for `callctx.FromContext`; when it carries
@@ -122,6 +122,8 @@ separate module in a separate repository, it is a fact about what `go get` can
 reach.
 
 The same boundary means your build does not inherit garm's dependency tree.
+What it does inherit is the contract — `github.com/garm-ai/contracts`, the
+wire types and the subject naming both sides agree on, and nothing else.
 
 ## What is deliberately not here
 
@@ -138,6 +140,12 @@ decodes the `Garm-Invocation` context onto the handler's `ctx` and refuses a
 request without one, bounds each endpoint with a worker pool
 (`garmtool.WithConcurrency`, default 16), lets a handler name its own error
 code with `toolbind.CodedError`, and drains on shutdown.
+
+**Upgrading from v0.5.0 or earlier moves you onto
+`github.com/garm-ai/contracts`.** A service still importing
+`github.com/garm-ai/garm/contracts/...` will link both copies of
+`garm/tool/v1` and panic at init on a duplicate proto registration — it
+builds, then dies on startup. Move your own imports in the same change.
 
 Health, middleware, idempotency and the conformance suite are not built. See
 `KNOWN-GAPS.md`.

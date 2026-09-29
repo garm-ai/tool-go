@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/garm-ai/garm/contracts/callctx"
-	"github.com/garm-ai/garm/contracts/wire"
+	"github.com/garm-ai/contracts/callctx"
+	"github.com/garm-ai/contracts/wire"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
 	"google.golang.org/protobuf/proto"

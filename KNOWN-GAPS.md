@@ -9,8 +9,9 @@
   descriptor hash per process, advertised on `$SRV.INFO` so a daemon can
   reconcile what is running against the catalogue it loaded.
 - **The invocation context is decoded and refused.** `Garm-Invocation`
-  (`garm/contracts/callctx`) is read off every request; absent, undecodable,
-  or decodable but carrying no `call_id` is `400 missing invocation context`
+  (`github.com/garm-ai/contracts/callctx`) is read off every request; absent,
+  undecodable, or decodable but carrying no `call_id` is
+  `400 missing invocation context`
   and the handler is never reached, because a request carrying none of these
   did not come through the chain. A context that does decode is on `ctx` for
   `callctx.FromContext`; when it carries a deadline, that absolute deadline
@@ -68,6 +69,16 @@ or observability against `$SRV.STATS` needs to know this before relying on it
 — which is the reason this is recorded here rather than only in a commit that
 scrolls out of view. This remains true until stats are computed from where the
 handler actually finishes, not from where `Handle` returns.
+
+## Not ours, and in the way
+
+**Upgrading past v0.5.0 is not a one-line bump for a consumer.** This module
+is on `github.com/garm-ai/contracts`. A service still importing
+`github.com/garm-ai/garm/contracts/...` links both copies of
+`garm/tool/v1`, and `protoregistry` **panics at init** —
+`proto: file "garm/tool/v1/attribution.proto" is already registered`. It
+builds; it dies on startup. The consumer's own imports have to move in the
+same change.
 
 ## Not built
 
