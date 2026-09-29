@@ -639,7 +639,7 @@ func TestAHandlerErrorWithNoMessageStillGetsAReply(t *testing.T) {
 }
 
 // Zero and negative are configuration mistakes, and the failure they would
-// produce is a service that starts cleanly and answers 429 to everything.
+// produce is a service that starts cleanly and subscribes to nothing.
 // Ignoring them leaves the default, which is the only safe reading.
 func TestANonPositiveConcurrencyLeavesTheDefault(t *testing.T) {
 	for _, n := range []int{0, -1} {
@@ -652,25 +652,24 @@ func TestANonPositiveConcurrencyLeavesTheDefault(t *testing.T) {
 
 // dispatch is where the stopping flag is read, so this drives that decision
 // directly rather than through a real NATS connection: end to end, the
-// window between svc.Stop returning and its subscription drain actually
+// window between micro's Stop returning and its subscription drain actually
 // taking effect is only as wide as NATS's own UNSUB round trip, which on a
 // local connection completes before a second request can be sent — not a
 // window a black-box test can reliably land in on demand.
 func TestADispatchThatFindsTheServiceStoppingRefusesRatherThanRuns(t *testing.T) {
-	s := New("calc", "v0.1.0", WithConcurrency(1))
+	s := New("calc", "v0.1.0")
 	if err := s.Endpoint(addRef(), newString, echo); err != nil {
 		t.Fatalf("registering: %v", err)
 	}
 	s.stopping = true
 
-	slots := make(chan struct{}, 1)
 	var inFlight sync.WaitGroup
 	r := &recorder{
 		data:    marshal(t, wrapperspb.String("x")),
 		headers: invocationHeaders(t, anInvocation()),
 	}
 
-	s.dispatch(context.Background(), s.eps[addRef().Subject], r, slots, &inFlight)
+	s.dispatch(context.Background(), s.eps[addRef().Subject], r, &inFlight)
 
 	if !r.errored {
 		t.Fatal("a request dispatched while the service was stopping was answered as a success")
@@ -680,9 +679,6 @@ func TestADispatchThatFindsTheServiceStoppingRefusesRatherThanRuns(t *testing.T)
 	}
 	if r.description != "shutting down" {
 		t.Errorf("description = %q, want %q", r.description, "shutting down")
-	}
-	if len(slots) != 0 {
-		t.Error("the slot taken to check stopping was never released")
 	}
 
 	// inFlight.Add must never have been called: a WaitGroup nothing was
@@ -700,24 +696,31 @@ func TestADispatchThatFindsTheServiceStoppingRefusesRatherThanRuns(t *testing.T)
 	}
 }
 
-// The ordinary path through dispatch — not stopping, a free slot — is what
-// every other test exercises through Run; this pins that dispatch itself,
-// called directly, still runs the handler and both releases happen once it
-// returns.
-func TestADispatchThatAcquiresRunsTheHandlerAndReleasesBoth(t *testing.T) {
-	s := New("calc", "v0.1.0", WithConcurrency(1))
+// The ordinary path through dispatch is what every other test exercises
+// through Run; this pins the two properties dispatch itself owns — the
+// handler has answered by the time dispatch returns, and inFlight is back to
+// zero by then too.
+//
+// "By the time it returns" is the whole contract. micro's reqHandler reads
+// req.respondError the instant Handle returns, so a dispatch that had not yet
+// replied would be racing that read on every refusal.
+func TestADispatchAnswersBeforeItReturns(t *testing.T) {
+	s := New("calc", "v0.1.0")
 	if err := s.Endpoint(addRef(), newString, echo); err != nil {
 		t.Fatalf("registering: %v", err)
 	}
 
-	slots := make(chan struct{}, 1)
 	var inFlight sync.WaitGroup
 	r := &recorder{
 		data:    marshal(t, wrapperspb.String("hello")),
 		headers: invocationHeaders(t, anInvocation()),
 	}
 
-	s.dispatch(context.Background(), s.eps[addRef().Subject], r, slots, &inFlight)
+	s.dispatch(context.Background(), s.eps[addRef().Subject], r, &inFlight)
+
+	if !r.answered {
+		t.Fatalf("dispatch returned before the request was answered; error was %q %q", r.code, r.description)
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -727,13 +730,49 @@ func TestADispatchThatAcquiresRunsTheHandlerAndReleasesBoth(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("inFlight never reached zero; dispatch's goroutine did not finish or never called Done")
+		t.Fatal("inFlight never reached zero by the time dispatch returned")
+	}
+}
+
+// A request whose deadline passed while it queued is refused rather than run.
+//
+// It is the only load shedding left once each subscription handles one
+// request at a time: capacity is not observable through micro, but a request
+// that arrives already expired waited somewhere, and on this hop the only
+// place to wait is the subscription's pending queue. Running it would spend a
+// slot — and take a real effect, for a non-idempotent tool — for a caller
+// that has already given up.
+func TestARequestThatIsAlreadyPastItsDeadlineIsRefusedWithoutRunningTheHandler(t *testing.T) {
+	ran := false
+	h := func(context.Context, proto.Message) (proto.Message, error) {
+		ran = true
+		return wrapperspb.String("done"), nil
 	}
 
-	if !r.answered {
-		t.Fatalf("no reply; error was %q %q", r.code, r.description)
+	ic := anInvocation()
+	ic.Deadline = timestamppb.New(time.Now().Add(-time.Millisecond))
+	r := callWithHeaders(t, h, marshal(t, wrapperspb.String("x")), invocationHeaders(t, ic))
+
+	if ran {
+		t.Error("the handler ran for a request whose caller had already timed out")
 	}
-	if len(slots) != 0 {
-		t.Error("the slot dispatch acquired was never released")
+	if r.code != "429" {
+		t.Fatalf("code = %q, want 429; garmd reads 429 as a service that is behind", r.code)
+	}
+	if !strings.Contains(r.description, "deadline") {
+		t.Errorf("description = %q, which does not say why it was refused", r.description)
+	}
+}
+
+// A deadline still ahead is not shedding. The boundary matters: a service
+// that refused anything carrying a deadline would refuse every request garmd
+// sends, since garmd sets one on every hop.
+func TestARequestWithTimeLeftIsRun(t *testing.T) {
+	ic := anInvocation()
+	ic.Deadline = timestamppb.New(time.Now().Add(30 * time.Second))
+	r := callWithHeaders(t, echo, marshal(t, wrapperspb.String("x")), invocationHeaders(t, ic))
+
+	if !r.answered {
+		t.Fatalf("a request with 30s left was refused %q %q", r.code, r.description)
 	}
 }
