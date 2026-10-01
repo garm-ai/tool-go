@@ -3,13 +3,19 @@ package garmtool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/garm-ai/garm/contracts/wire"
+	"github.com/garm-ai/contracts/callctx"
+	toolv1 "github.com/garm-ai/contracts/garm/tool/v1"
+	"github.com/garm-ai/contracts/wire"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/garm-ai/tool-go/toolbind"
@@ -42,9 +48,10 @@ func echo(_ context.Context, req proto.Message) (proto.Message, error) {
 // recorder stands in for a micro.Request so the handler's decisions can be
 // read back without a server. Only what the handler touches is implemented;
 // the rest panics rather than returning a zero value, because a silently
-// empty Headers() would make a future test pass for the wrong reason.
+// empty answer would make a future test pass for the wrong reason.
 type recorder struct {
-	data []byte
+	data    []byte
+	headers micro.Headers
 
 	code, description string
 	body              []byte
@@ -63,18 +70,56 @@ func (r *recorder) Error(code, description string, _ []byte, _ ...micro.RespondO
 
 func (r *recorder) Data() []byte                               { return r.data }
 func (r *recorder) RespondJSON(any, ...micro.RespondOpt) error { panic("the handler marshals itself") }
-func (r *recorder) Headers() micro.Headers                     { panic("the handler reads no headers") }
 func (r *recorder) Subject() string                            { panic("the handler routes by registration") }
 func (r *recorder) Reply() string                              { panic("micro owns the reply subject") }
 
-// call drives the handler the way Run does, with one endpoint and one request.
+// Headers is what the runtime reads the invocation context off. A nil map is
+// a legitimate state — it is what a caller that set no headers produces — and
+// Get on one returns "", which is exactly the input the refusal below exists
+// for.
+func (r *recorder) Headers() micro.Headers { return r.headers }
+
+// anInvocation is what garmd puts on the wire: assertions about the caller,
+// never a credential. call_id is required — callctx.Decode refuses a context
+// without one, because code that needs the call id must notice its absence
+// rather than ledger an empty string.
+func anInvocation() *toolv1.InvocationContext {
+	return &toolv1.InvocationContext{
+		CallId: "call-1",
+		Attribution: &toolv1.CallContext{
+			Tenant:        "acme",
+			CorrelationId: "corr-1",
+		},
+		Principal: &toolv1.InvocationPrincipal{
+			Subject: "user:jdoe",
+			Kind:    toolv1.PrincipalKind_PRINCIPAL_KIND_USER,
+		},
+	}
+}
+
+func invocationHeaders(t *testing.T, ic *toolv1.InvocationContext) micro.Headers {
+	t.Helper()
+	enc, err := callctx.Encode(ic)
+	if err != nil {
+		t.Fatalf("encoding the invocation context: %v", err)
+	}
+	return micro.Headers{callctx.Header: []string{enc}}
+}
+
+// call drives the handler the way Run does, with one endpoint and one request
+// carrying the invocation context garmd sets on every hop.
 func call(t *testing.T, h toolbind.Handler, data []byte) *recorder {
+	t.Helper()
+	return callWithHeaders(t, h, data, invocationHeaders(t, anInvocation()))
+}
+
+func callWithHeaders(t *testing.T, h toolbind.Handler, data []byte, hdr micro.Headers) *recorder {
 	t.Helper()
 	s := New("calc", "v0.1.0")
 	if err := s.Endpoint(addRef(), newString, h); err != nil {
 		t.Fatalf("registering: %v", err)
 	}
-	r := &recorder{data: data}
+	r := &recorder{data: data, headers: hdr}
 	s.handle(context.Background(), s.eps[addRef().Subject], r)
 	return r
 }
@@ -316,5 +361,418 @@ func TestTheNamingIsTheContractsAndNotACopy(t *testing.T) {
 	}
 	if QueueGroup(addRoute) != wire.QueueGroup(addRoute) {
 		t.Errorf("QueueGroup diverged from the contract: %q vs %q", QueueGroup(addRoute), wire.QueueGroup(addRoute))
+	}
+}
+
+// garmd sets this header on every hop. A request without one did not come
+// through the chain — nobody authenticated it, nobody authorised it, nobody
+// will ledger it — and a tool that served it anyway would be the unpoliced
+// door the whole architecture exists to remove.
+func TestARequestWithNoInvocationContextIsRefusedAndTheHandlerIsNeverCalled(t *testing.T) {
+	var called bool
+	seen := func(context.Context, proto.Message) (proto.Message, error) {
+		called = true
+		return wrapperspb.String("x"), nil
+	}
+
+	r := callWithHeaders(t, seen, marshal(t, wrapperspb.String("hi")), nil)
+
+	if called {
+		t.Error("the handler ran for a request carrying no invocation context")
+	}
+	if !r.errored {
+		t.Fatal("a request with no invocation context was answered as a success")
+	}
+	if r.code != "400" {
+		t.Errorf("code = %q, want 400: the caller sent a malformed request, this "+
+			"service did not fail", r.code)
+	}
+	if r.description != "missing invocation context" {
+		t.Errorf("description = %q, want %q", r.description, "missing invocation context")
+	}
+}
+
+// A header that is present and unreadable is the same refusal as an absent
+// one. It is attacker-reachable the moment NATS subject permissions are
+// misconfigured, so it must never become a half-built context a handler
+// trusts.
+func TestAnUndecodableInvocationContextIsRefused(t *testing.T) {
+	for _, c := range []struct{ name, value string }{
+		{"not base64", "!!! not base64 !!!"},
+		{"not a protobuf", "/////////w=="},
+		{"no call id", func() string {
+			enc, err := callctx.Encode(&toolv1.InvocationContext{
+				Principal: &toolv1.InvocationPrincipal{Subject: "user:jdoe"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return enc
+		}()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var called bool
+			seen := func(context.Context, proto.Message) (proto.Message, error) {
+				called = true
+				return wrapperspb.String("x"), nil
+			}
+
+			r := callWithHeaders(t, seen, marshal(t, wrapperspb.String("hi")),
+				micro.Headers{callctx.Header: []string{c.value}})
+
+			if called {
+				t.Error("the handler ran for an undecodable invocation context")
+			}
+			if r.code != "400" || r.description != "missing invocation context" {
+				t.Errorf("answered %q %q, want 400 \"missing invocation context\"",
+					r.code, r.description)
+			}
+		})
+	}
+}
+
+// The context is the whole point of the header: a handler that needs to know
+// who it is acting for reads it from ctx, and nowhere else. It never carries
+// the caller's token.
+func TestTheInvocationContextReachesTheHandler(t *testing.T) {
+	var got *toolv1.InvocationContext
+	seen := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		got = callctx.FromContext(ctx)
+		return wrapperspb.String("x"), nil
+	}
+
+	r := call(t, seen, marshal(t, wrapperspb.String("hi")))
+
+	if !r.answered {
+		t.Fatalf("no reply; error was %q %q", r.code, r.description)
+	}
+	if got == nil {
+		t.Fatal("callctx.FromContext returned nothing inside the handler")
+	}
+	if got.GetCallId() != "call-1" {
+		t.Errorf("call_id = %q, want call-1", got.GetCallId())
+	}
+	if got.GetPrincipal().GetSubject() != "user:jdoe" {
+		t.Errorf("subject = %q, want user:jdoe", got.GetPrincipal().GetSubject())
+	}
+	if got.GetPrincipal().GetKind() != toolv1.PrincipalKind_PRINCIPAL_KIND_USER {
+		t.Errorf("kind = %v, want USER", got.GetPrincipal().GetKind())
+	}
+	if got.GetAttribution().GetCorrelationId() != "corr-1" {
+		t.Errorf("correlation_id = %q; the ledger cannot join this call to its caller",
+			got.GetAttribution().GetCorrelationId())
+	}
+}
+
+// The deadline is ABSOLUTE and came from the caller, so it bounds the handler
+// rather than restarting on this hop. A handler that outlives it is doing work
+// for a caller that has already given up.
+func TestTheInvocationDeadlineBoundsTheHandlersContext(t *testing.T) {
+	want := time.Now().Add(2 * time.Second)
+	ic := anInvocation()
+	ic.Deadline = timestamppb.New(want)
+
+	var deadline time.Time
+	var ok bool
+	seen := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		deadline, ok = ctx.Deadline()
+		return wrapperspb.String("x"), nil
+	}
+
+	callWithHeaders(t, seen, marshal(t, wrapperspb.String("hi")), invocationHeaders(t, ic))
+
+	if !ok {
+		t.Fatal("the handler's context carried no deadline; the caller's bound was dropped")
+	}
+	if d := deadline.Sub(want); d > time.Second || d < -time.Second {
+		t.Errorf("deadline = %s, want %s", deadline, want)
+	}
+}
+
+// No deadline on the context is a legitimate state — garmd sets one only when
+// its own caller did — and must not become an instantly-expired handler.
+func TestAnInvocationWithNoDeadlineLeavesTheHandlerUnbounded(t *testing.T) {
+	var ok bool
+	seen := func(ctx context.Context, _ proto.Message) (proto.Message, error) {
+		_, ok = ctx.Deadline()
+		return wrapperspb.String("x"), nil
+	}
+
+	call(t, seen, marshal(t, wrapperspb.String("hi")))
+
+	if ok {
+		t.Error("a deadline was invented for a call that carried none")
+	}
+}
+
+// The two-argument form is what every existing service's main calls. Adding
+// options must not make it a compile error to upgrade.
+func TestTheTwoArgumentConstructorStillCompilesAndGetsTheDefault(t *testing.T) {
+	if got := New("calc", "v0.1.0").concurrency; got != DefaultConcurrency {
+		t.Errorf("concurrency = %d, want the default %d", got, DefaultConcurrency)
+	}
+	if got := New("calc", "v0.1.0", WithConcurrency(3)).concurrency; got != 3 {
+		t.Errorf("concurrency = %d, want 3", got)
+	}
+}
+
+// A handler with a more specific answer than "this service broke" can now give
+// it. The daemon reads the code off the reply header, so before this every
+// failure — a missing account, an argument the tool will never accept — was a
+// 500, and the caller could not tell a tool that was broken from a tool that
+// had answered.
+func TestAHandlerCanChooseTheErrorCode(t *testing.T) {
+	missing := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, toolbind.CodedError{Code: "404", Message: "no such account"}
+	}
+
+	r := call(t, missing, marshal(t, wrapperspb.String("a-1")))
+
+	if r.answered {
+		t.Fatal("a handler error was replied to as a success")
+	}
+	if r.code != "404" {
+		t.Errorf("code = %q, want 404: the handler's own classification was dropped", r.code)
+	}
+	if r.description != "no such account" {
+		t.Errorf("description = %q, want the handler's message", r.description)
+	}
+}
+
+// Wrapping is the ordinary way a handler adds context. Losing the code there
+// would mean the feature works only for handlers that return the error bare,
+// which is the half nobody writes.
+func TestAWrappedCodedErrorKeepsItsCode(t *testing.T) {
+	wrapping := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, fmt.Errorf("looking up the account: %w",
+			toolbind.CodedError{Code: "404", Message: "no such account"})
+	}
+
+	r := call(t, wrapping, marshal(t, wrapperspb.String("a-1")))
+
+	if r.code != "404" {
+		t.Errorf("code = %q, want 404", r.code)
+	}
+	// The CodedError's own message, not the wrapper's. What the handler chose
+	// to publish is the coded part; the context it added is for its own logs.
+	if r.description != "no such account" {
+		t.Errorf("description = %q, want the coded message", r.description)
+	}
+}
+
+// Everything else is still a 500 carrying the handler's words. A tool failing
+// for a reason it can state is the common case, and "500" alone is not
+// actionable — but neither is an invented code.
+func TestAnUncodedHandlerErrorIsStillAFiveHundred(t *testing.T) {
+	failing := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, errors.New("divide by zero")
+	}
+
+	r := call(t, failing, marshal(t, wrapperspb.String("2")))
+
+	if r.code != "500" {
+		t.Errorf("code = %q, want 500", r.code)
+	}
+	if r.description != "divide by zero" {
+		t.Errorf("description = %q; the handler's reason did not survive", r.description)
+	}
+}
+
+// An empty code is a handler mistake, and NATS micro's request.Error refuses
+// an empty code outright — it returns an error and never replies at all,
+// which would leave the caller hanging until its own deadline rather than
+// seeing a failure. 500 is the honest fallback: something went wrong and this
+// service did not classify it.
+func TestACodedErrorWithNoCodeFallsBackToFiveHundred(t *testing.T) {
+	blank := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, toolbind.CodedError{Message: "something went wrong"}
+	}
+
+	r := call(t, blank, marshal(t, wrapperspb.String("2")))
+
+	if r.code != "500" {
+		t.Errorf("code = %q, want 500: an empty code would make micro refuse to "+
+			"reply at all, leaving the caller to hang until its own deadline", r.code)
+	}
+	if r.description != "something went wrong" {
+		t.Errorf("description = %q", r.description)
+	}
+}
+
+// micro's request.Error refuses an empty description exactly as it refuses
+// an empty code — no reply at all, and the caller hangs until its own
+// deadline. A handler that named a code but left Message unset must still
+// get a reply, so the code stands in for the description too.
+func TestACodedErrorWithNoMessageStillGetsAReply(t *testing.T) {
+	noMessage := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, toolbind.CodedError{Code: "404"}
+	}
+
+	r := call(t, noMessage, marshal(t, wrapperspb.String("a-1")))
+
+	if r.code != "404" {
+		t.Errorf("code = %q, want 404", r.code)
+	}
+	if r.description == "" {
+		t.Fatal("description is empty: micro would refuse to send this reply at " +
+			"all, leaving the caller to hang until its own deadline")
+	}
+}
+
+// The same guard applies on the 500 path: a handler error whose Error() is
+// empty must not become an empty description, or micro refuses the reply
+// outright and the caller hangs rather than sees a failure.
+func TestAHandlerErrorWithNoMessageStillGetsAReply(t *testing.T) {
+	blank := func(context.Context, proto.Message) (proto.Message, error) {
+		return nil, errors.New("")
+	}
+
+	r := call(t, blank, marshal(t, wrapperspb.String("2")))
+
+	if r.code != "500" {
+		t.Errorf("code = %q, want 500", r.code)
+	}
+	if r.description == "" {
+		t.Fatal("description is empty: micro would refuse to send this reply at " +
+			"all, leaving the caller to hang until its own deadline")
+	}
+}
+
+// Zero and negative are configuration mistakes, and the failure they would
+// produce is a service that starts cleanly and subscribes to nothing.
+// Ignoring them leaves the default, which is the only safe reading.
+func TestANonPositiveConcurrencyLeavesTheDefault(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		if got := New("calc", "v0.1.0", WithConcurrency(n)).concurrency; got != DefaultConcurrency {
+			t.Errorf("WithConcurrency(%d) gave %d, want the default %d",
+				n, got, DefaultConcurrency)
+		}
+	}
+}
+
+// dispatch is where the stopping flag is read, so this drives that decision
+// directly rather than through a real NATS connection: end to end, the
+// window between micro's Stop returning and its subscription drain actually
+// taking effect is only as wide as NATS's own UNSUB round trip, which on a
+// local connection completes before a second request can be sent — not a
+// window a black-box test can reliably land in on demand.
+func TestADispatchThatFindsTheServiceStoppingRefusesRatherThanRuns(t *testing.T) {
+	s := New("calc", "v0.1.0")
+	if err := s.Endpoint(addRef(), newString, echo); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+	s.stopping = true
+
+	var inFlight sync.WaitGroup
+	r := &recorder{
+		data:    marshal(t, wrapperspb.String("x")),
+		headers: invocationHeaders(t, anInvocation()),
+	}
+
+	s.dispatch(context.Background(), s.eps[addRef().Subject], r, &inFlight)
+
+	if !r.errored {
+		t.Fatal("a request dispatched while the service was stopping was answered as a success")
+	}
+	if r.code != "503" {
+		t.Errorf("code = %q, want 503", r.code)
+	}
+	if r.description != "shutting down" {
+		t.Errorf("description = %q, want %q", r.description, "shutting down")
+	}
+
+	// inFlight.Add must never have been called: a WaitGroup nothing was
+	// added to returns from Wait immediately, so a Wait that blocks here
+	// would mean dispatch added to it despite refusing the request.
+	done := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("inFlight.Add was called for a request dispatch refused")
+	}
+}
+
+// The ordinary path through dispatch is what every other test exercises
+// through Run; this pins the two properties dispatch itself owns — the
+// handler has answered by the time dispatch returns, and inFlight is back to
+// zero by then too.
+//
+// "By the time it returns" is the whole contract. micro's reqHandler reads
+// req.respondError the instant Handle returns, so a dispatch that had not yet
+// replied would be racing that read on every refusal.
+func TestADispatchAnswersBeforeItReturns(t *testing.T) {
+	s := New("calc", "v0.1.0")
+	if err := s.Endpoint(addRef(), newString, echo); err != nil {
+		t.Fatalf("registering: %v", err)
+	}
+
+	var inFlight sync.WaitGroup
+	r := &recorder{
+		data:    marshal(t, wrapperspb.String("hello")),
+		headers: invocationHeaders(t, anInvocation()),
+	}
+
+	s.dispatch(context.Background(), s.eps[addRef().Subject], r, &inFlight)
+
+	if !r.answered {
+		t.Fatalf("dispatch returned before the request was answered; error was %q %q", r.code, r.description)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("inFlight never reached zero by the time dispatch returned")
+	}
+}
+
+// A request whose deadline passed while it queued is refused rather than run.
+//
+// It is the only load shedding left once each subscription handles one
+// request at a time: capacity is not observable through micro, but a request
+// that arrives already expired waited somewhere, and on this hop the only
+// place to wait is the subscription's pending queue. Running it would spend a
+// slot — and take a real effect, for a non-idempotent tool — for a caller
+// that has already given up.
+func TestARequestThatIsAlreadyPastItsDeadlineIsRefusedWithoutRunningTheHandler(t *testing.T) {
+	ran := false
+	h := func(context.Context, proto.Message) (proto.Message, error) {
+		ran = true
+		return wrapperspb.String("done"), nil
+	}
+
+	ic := anInvocation()
+	ic.Deadline = timestamppb.New(time.Now().Add(-time.Millisecond))
+	r := callWithHeaders(t, h, marshal(t, wrapperspb.String("x")), invocationHeaders(t, ic))
+
+	if ran {
+		t.Error("the handler ran for a request whose caller had already timed out")
+	}
+	if r.code != "429" {
+		t.Fatalf("code = %q, want 429; garmd reads 429 as a service that is behind", r.code)
+	}
+	if !strings.Contains(r.description, "deadline") {
+		t.Errorf("description = %q, which does not say why it was refused", r.description)
+	}
+}
+
+// A deadline still ahead is not shedding. The boundary matters: a service
+// that refused anything carrying a deadline would refuse every request garmd
+// sends, since garmd sets one on every hop.
+func TestARequestWithTimeLeftIsRun(t *testing.T) {
+	ic := anInvocation()
+	ic.Deadline = timestamppb.New(time.Now().Add(30 * time.Second))
+	r := callWithHeaders(t, echo, marshal(t, wrapperspb.String("x")), invocationHeaders(t, ic))
+
+	if !r.answered {
+		t.Fatalf("a request with 30s left was refused %q %q", r.code, r.description)
 	}
 }

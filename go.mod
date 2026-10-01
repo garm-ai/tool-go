@@ -3,7 +3,7 @@ module github.com/garm-ai/tool-go
 go 1.26.0
 
 require (
-	github.com/garm-ai/garm v0.4.0
+	github.com/garm-ai/contracts v0.2.0
 	// Tests only. The bugs that produced a service which started cleanly and
 	// answered nothing were all invisible from inside the process, so the
 	// round-trip tests talk to a real broker — embedded, on a port the kernel
